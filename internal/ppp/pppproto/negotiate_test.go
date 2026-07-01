@@ -59,9 +59,10 @@ func (l *fakeLink) sent(t *testing.T) []byte {
 func TestNegotiateLCP_SimplePeer(t *testing.T) {
 	link := newFakeLink()
 
-	// Drive a scripted peer in the background: it Acks our request as-is,
-	// and sends its own Configure-Request with just a Magic-Number, which
-	// we must Ack.
+	// Drive a scripted peer in the background: it sends its own
+	// Configure-Request with just a Magic-Number (which we must Ack) BEFORE
+	// acking ours, matching how a real Configure-Ack from the peer arrives
+	// once negotiation is already satisfied on our side.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -79,9 +80,6 @@ func TestNegotiateLCP_SimplePeer(t *testing.T) {
 		if _, ok := cf.FindOption(LCPOptMRU); !ok {
 			t.Errorf("expected MRU option in our request")
 		}
-		// Ack our request.
-		ack := ConfigFrame{Code: CodeConfigureAck, ID: cf.ID, Options: cf.Options}
-		link.deliver(BuildFrame(ProtoLCP, ack.Marshal()))
 
 		// Peer sends its own request with a Magic-Number.
 		magic := make([]byte, 4)
@@ -100,12 +98,48 @@ func TestNegotiateLCP_SimplePeer(t *testing.T) {
 		if rcf.Code != CodeConfigureAck || rcf.ID != 7 {
 			t.Errorf("expected Ack(id=7) of peer request, got code=%d id=%d", rcf.Code, rcf.ID)
 		}
+
+		// Now ack our own request — negotiation should complete right after.
+		ack := ConfigFrame{Code: CodeConfigureAck, ID: cf.ID, Options: cf.Options}
+		link.deliver(BuildFrame(ProtoLCP, ack.Marshal()))
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := NegotiateLCP(ctx, link, LCPOptions{MRU: 1354}); err != nil {
 		t.Fatalf("NegotiateLCP failed: %v", err)
+	}
+	<-done
+}
+
+// TestNegotiateLCP_PeerNeverSendsOwnRequest is a regression test for a real
+// hang observed against a FortiGate gateway: some gateways only ever
+// passively Ack the client's Configure-Request and never propose their own.
+// A strict "both sides must negotiate" implementation waits for a peer
+// Configure-Request that never arrives and hangs until NegotiateTimeout;
+// negotiation must instead complete as soon as the peer Acks our request.
+func TestNegotiateLCP_PeerNeverSendsOwnRequest(t *testing.T) {
+	link := newFakeLink()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ourReq := link.sent(t)
+		_, payload, _ := Protocol(ourReq)
+		cf, _ := ParseConfigFrame(payload)
+		ack := ConfigFrame{Code: CodeConfigureAck, ID: cf.ID, Options: cf.Options}
+		link.deliver(BuildFrame(ProtoLCP, ack.Marshal()))
+		// The peer never sends its own Configure-Request — that's the point.
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := NegotiateLCP(ctx, link, LCPOptions{MRU: 1354}); err != nil {
+		t.Fatalf("NegotiateLCP failed: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("NegotiateLCP took %s — should return as soon as our request is Acked, not wait for a peer request that never comes", elapsed)
 	}
 	<-done
 }
@@ -119,8 +153,6 @@ func TestNegotiateLCP_RejectsAuthAndCompression(t *testing.T) {
 		ourReq := link.sent(t)
 		_, payload, _ := Protocol(ourReq)
 		cf, _ := ParseConfigFrame(payload)
-		ack := ConfigFrame{Code: CodeConfigureAck, ID: cf.ID, Options: cf.Options}
-		link.deliver(BuildFrame(ProtoLCP, ack.Marshal()))
 
 		// Peer proposes PFC + ACFC + an auth protocol — all must be rejected.
 		peerReq := ConfigFrame{Code: CodeConfigureRequest, ID: 1, Options: []Option{
@@ -152,6 +184,10 @@ func TestNegotiateLCP_RejectsAuthAndCompression(t *testing.T) {
 		if rcf2.Code != CodeConfigureAck || rcf2.ID != 2 {
 			t.Errorf("expected Ack(id=2), got code=%d id=%d", rcf2.Code, rcf2.ID)
 		}
+
+		// Now ack our own request — negotiation should complete right after.
+		ack := ConfigFrame{Code: CodeConfigureAck, ID: cf.ID, Options: cf.Options}
+		link.deliver(BuildFrame(ProtoLCP, ack.Marshal()))
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -209,10 +245,8 @@ func TestNegotiateIPCP_NakThenAck(t *testing.T) {
 			t.Errorf("expected resent IP-Address %v, got %v", net.IP(assigned), net.IP(ip2.Data))
 		}
 
-		ack := ConfigFrame{Code: CodeConfigureAck, ID: cf2.ID, Options: cf2.Options}
-		link.deliver(BuildFrame(ProtoIPCP, ack.Marshal()))
-
-		// Peer's own Configure-Request for its side of the link.
+		// Peer's own Configure-Request for its side of the link, sent before
+		// it Acks ours.
 		peerReq := ConfigFrame{Code: CodeConfigureRequest, ID: 1, Options: []Option{
 			{Type: IPCPOptIPAddress, Data: net.ParseIP("198.51.100.1").To4()},
 		}}
@@ -224,6 +258,9 @@ func TestNegotiateIPCP_NakThenAck(t *testing.T) {
 		if rcf.Code != CodeConfigureAck {
 			t.Errorf("expected Ack of peer's IPCP request, got code=%d", rcf.Code)
 		}
+
+		ack := ConfigFrame{Code: CodeConfigureAck, ID: cf2.ID, Options: cf2.Options}
+		link.deliver(BuildFrame(ProtoIPCP, ack.Marshal()))
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -248,6 +285,48 @@ func TestNegotiateIPCP_NakThenAck(t *testing.T) {
 	}
 }
 
+// TestNegotiateIPCP_PeerNeverSendsOwnRequest is the IPCP counterpart to
+// TestNegotiateLCP_PeerNeverSendsOwnRequest: negotiation must complete once
+// the peer Naks-then-Acks our own request, even if it never proposes its own.
+func TestNegotiateIPCP_PeerNeverSendsOwnRequest(t *testing.T) {
+	link := newFakeLink()
+	assigned := net.ParseIP("198.51.100.42").To4()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		req1 := link.sent(t)
+		_, payload, _ := Protocol(req1)
+		cf1, _ := ParseConfigFrame(payload)
+		nak := ConfigFrame{Code: CodeConfigureNak, ID: cf1.ID, Options: []Option{
+			{Type: IPCPOptIPAddress, Data: assigned},
+		}}
+		link.deliver(BuildFrame(ProtoIPCP, nak.Marshal()))
+
+		req2 := link.sent(t)
+		_, payload, _ = Protocol(req2)
+		cf2, _ := ParseConfigFrame(payload)
+		ack := ConfigFrame{Code: CodeConfigureAck, ID: cf2.ID, Options: cf2.Options}
+		link.deliver(BuildFrame(ProtoIPCP, ack.Marshal()))
+		// The peer never sends its own Configure-Request — that's the point.
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	result, err := NegotiateIPCP(ctx, link, IPCPOptions{})
+	if err != nil {
+		t.Fatalf("NegotiateIPCP failed: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("NegotiateIPCP took %s — should return once our request is Acked, not wait for a peer request that never comes", elapsed)
+	}
+	if !result.LocalIP.Equal(net.IP(assigned)) {
+		t.Errorf("LocalIP = %v, want %v", result.LocalIP, net.IP(assigned))
+	}
+	<-done
+}
+
 func TestNegotiateIPCP_RejectsCompression(t *testing.T) {
 	link := newFakeLink()
 
@@ -269,8 +348,6 @@ func TestNegotiateIPCP_RejectsCompression(t *testing.T) {
 		req2 := link.sent(t)
 		_, payload, _ = Protocol(req2)
 		cf2, _ := ParseConfigFrame(payload)
-		ack := ConfigFrame{Code: CodeConfigureAck, ID: cf2.ID, Options: cf2.Options}
-		link.deliver(BuildFrame(ProtoIPCP, ack.Marshal()))
 
 		peerReq := ConfigFrame{Code: CodeConfigureRequest, ID: 1, Options: []Option{
 			{Type: IPCPOptIPCompression, Data: []byte{0x00, 0x2d, 0x0f, 0x01}},
@@ -293,6 +370,10 @@ func TestNegotiateIPCP_RejectsCompression(t *testing.T) {
 		if rcf2.Code != CodeConfigureAck {
 			t.Errorf("expected final Ack, got code=%d", rcf2.Code)
 		}
+
+		// Now ack our own request — negotiation should complete right after.
+		ack := ConfigFrame{Code: CodeConfigureAck, ID: cf2.ID, Options: cf2.Options}
+		link.deliver(BuildFrame(ProtoIPCP, ack.Marshal()))
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

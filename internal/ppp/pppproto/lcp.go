@@ -15,11 +15,15 @@ type LCPOptions struct {
 }
 
 // NegotiateLCP drives LCP to the Opened state against a single peer: our own
-// Configure-Request must be Acked, and the peer's Configure-Request must be
-// Acked by us. It intentionally never negotiates authentication, protocol
-// field compression (PFC) or address/control field compression (ACFC) —
-// matching pppd's "noauth noaccomp nopcomp" flags used on Unix — by
-// rejecting those options if the peer proposes them for its own frames.
+// Configure-Request must be Acked by the peer. A peer's own Configure-Request
+// is Acked if one arrives, but — unlike a textbook symmetric LCP exchange —
+// is not required: several FortiGate gateways only ever passively Ack the
+// client's request and never propose their own, which a strict "both sides
+// must negotiate" implementation would wait on forever. It intentionally
+// never negotiates authentication, protocol field compression (PFC) or
+// address/control field compression (ACFC) — matching pppd's "noauth
+// noaccomp nopcomp" flags used on Unix — by rejecting those options if the
+// peer proposes them for its own frames.
 //
 // Any LCP Echo-Request seen during negotiation is answered immediately so an
 // impatient peer doesn't give up while we're still negotiating.
@@ -35,9 +39,9 @@ func NegotiateLCP(ctx context.Context, link Link, opts LCPOptions) error {
 		return fmt.Errorf("pppproto: LCP: %w", err)
 	}
 
-	var weAckedPeer, peerAckedUs bool
+	var peerAckedUs bool
 	retries := 0
-	for !weAckedPeer || !peerAckedUs {
+	for !peerAckedUs {
 		pkt, err := link.Recv(ctx)
 		if err != nil {
 			return fmt.Errorf("pppproto: LCP negotiation: %w", err)
@@ -53,15 +57,13 @@ func NegotiateLCP(ctx context.Context, link Link, opts LCPOptions) error {
 
 		switch cf.Code {
 		case CodeConfigureRequest:
-			resp, rejected := reviewPeerLCPRequest(cf)
+			// Opportunistic: Ack (or reject) the peer's own Configure-Request
+			// if it sends one, but don't require it to reach Opened — see
+			// the doc comment above.
+			resp, _ := reviewPeerLCPRequest(cf)
 			if err := link.Send(BuildFrame(ProtoLCP, resp.Marshal())); err != nil {
 				return fmt.Errorf("pppproto: LCP: %w", err)
 			}
-			if !rejected {
-				weAckedPeer = true
-			}
-			// If we rejected something, the peer is expected to resend a
-			// corrected Configure-Request; loop and wait for it.
 
 		case CodeConfigureAck:
 			if cf.ID == id {

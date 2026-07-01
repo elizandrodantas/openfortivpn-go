@@ -48,10 +48,13 @@ func NegotiateIPCP(ctx context.Context, link Link, opts IPCPOptions) (IPCPResult
 		return IPCPResult{}, fmt.Errorf("pppproto: IPCP: %w", err)
 	}
 
+	// Like NegotiateLCP, completion only requires the peer to Ack our own
+	// Configure-Request — a peer's own Configure-Request is handled if one
+	// arrives, but some gateways never send one and only passively Ack ours.
 	var result IPCPResult
-	var weAckedPeer, peerAckedUs bool
+	var peerAckedUs bool
 	retries := 0
-	for !weAckedPeer || !peerAckedUs {
+	for !peerAckedUs {
 		pkt, err := link.Recv(ctx)
 		if err != nil {
 			return IPCPResult{}, fmt.Errorf("pppproto: IPCP negotiation: %w", err)
@@ -61,12 +64,19 @@ func NegotiateIPCP(ctx context.Context, link Link, opts IPCPOptions) (IPCPResult
 			continue
 		}
 		if proto == ProtoLCP {
-			// A late LCP Echo-Request during IPCP negotiation; answer it so
-			// the peer doesn't time out waiting on us.
-			if cf, err := ParseConfigFrame(payload); err == nil && cf.Code == CodeEchoRequest {
-				if ef, ok := ParseEchoFrame(payload); ok {
-					reply := EchoFrame{Code: CodeEchoReply, ID: ef.ID, Magic: ef.Magic}
-					_ = link.Send(BuildFrame(ProtoLCP, reply.Marshal()))
+			// A late LCP Echo-Request/Configure-Request during IPCP
+			// negotiation; answer it so the peer doesn't time out waiting
+			// on us or think LCP itself dropped.
+			if cf, err := ParseConfigFrame(payload); err == nil {
+				switch cf.Code {
+				case CodeEchoRequest:
+					if ef, ok := ParseEchoFrame(payload); ok {
+						reply := EchoFrame{Code: CodeEchoReply, ID: ef.ID, Magic: ef.Magic}
+						_ = link.Send(BuildFrame(ProtoLCP, reply.Marshal()))
+					}
+				case CodeConfigureRequest:
+					resp, _ := reviewPeerLCPRequest(cf)
+					_ = link.Send(BuildFrame(ProtoLCP, resp.Marshal()))
 				}
 			}
 			continue
@@ -86,7 +96,6 @@ func NegotiateIPCP(ctx context.Context, link Link, opts IPCPOptions) (IPCPResult
 				return IPCPResult{}, fmt.Errorf("pppproto: IPCP: %w", err)
 			}
 			if !rejected {
-				weAckedPeer = true
 				if ip, ok := cf.FindOption(IPCPOptIPAddress); ok && len(ip.Data) == 4 {
 					result.PeerIP = net.IP(ip.Data).To4()
 				}
