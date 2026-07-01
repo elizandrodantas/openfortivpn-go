@@ -32,6 +32,7 @@ import (
 	"github.com/elizandrodantas/openfortivpn-go/internal/config"
 	"github.com/elizandrodantas/openfortivpn-go/internal/hdlc"
 	"github.com/elizandrodantas/openfortivpn-go/internal/ppp/pppproto"
+	"github.com/elizandrodantas/openfortivpn-go/internal/ppp/wintundll"
 )
 
 const (
@@ -70,9 +71,13 @@ func Start(cfg *config.Config) (*Process, error) {
 		name = cfg.PPPDIfname
 	}
 
+	if err := wintundll.Ensure(); err != nil {
+		return nil, fmt.Errorf("ppp: prepare wintun.dll: %w", err)
+	}
+
 	adapter, err := wintun.CreateAdapter(name, "Wintun", nil)
 	if err != nil {
-		return nil, fmt.Errorf("ppp: create wintun adapter %q (is wintun.dll present, and are you running as Administrator?): %w", name, err)
+		return nil, fmt.Errorf("ppp: create wintun adapter %q (are you running as Administrator?): %w", name, err)
 	}
 	session, err := adapter.StartSession(ringCapacity)
 	if err != nil {

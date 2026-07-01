@@ -82,7 +82,7 @@ Single static binaries for:
 ## Requirements
 
 - A system `pppd` binary on **Linux** and **macOS** (openfortivpn-go shells out to it, matching the original client's architecture) — e.g. `apt install ppp` / `dnf install ppp` on Linux; macOS ships `pppd` out of the box.
-- On **Windows**, the [`wintun.dll`](https://www.wintun.net/) driver must be present next to the executable (or in `System32`) — see [Known limitations](#known-limitations).
+- **Windows** needs no separate driver install: if `wintun.dll` (the [`wintun`](https://www.wintun.net/) driver — the same one WireGuard/Tailscale use) isn't already present next to the executable or in `System32`, it's downloaded automatically on first run for the correct architecture, with its checksum verified before use. Requires internet access on first run; place a trusted copy of `wintun.dll` next to the executable yourself to skip the download entirely.
 - **Root/administrator privileges** — required to run `pppd` (or create the TUN adapter on Windows), modify the routing table, and change DNS configuration. Run with `sudo` on Linux/macOS or an elevated shell on Windows.
 
 ## Installation
@@ -268,7 +268,7 @@ The version string embedded in binaries (visible via `--version`) is derived fro
 
 ## Known limitations
 
-- **Windows support is new and needs real-world testing.** Since there's no `pppd` on Windows, `openfortivpn-go` implements its own minimal PPP client (LCP/IPCP negotiation, see `internal/ppp/pppproto`) on top of a [`wintun`](https://www.wintun.net/) virtual adapter. It requires **Administrator privileges** and the `wintun.dll` driver to be present next to the executable (or in `System32`) — it is not bundled with releases yet. If you hit issues, please open one with `-vvv --log-file` output attached.
+- **Windows support is new and needs real-world testing.** Since there's no `pppd` on Windows, `openfortivpn-go` implements its own minimal PPP client (LCP/IPCP negotiation, see `internal/ppp/pppproto`) on top of a [`wintun`](https://www.wintun.net/) virtual adapter. It requires **Administrator privileges**; `wintun.dll` is fetched automatically on first run if not already present (see [Requirements](#requirements)), which needs internet access at that point. If you hit issues, please open one with `-vvv --log-file` output attached.
 - macOS DNS integration writes scoped resolver entries under `/etc/resolver/<domain>` as a fallback; this is not a global default-resolver override the way the official FortiClient (a signed `NetworkExtension`) can achieve. In practice this only matters if the gateway doesn't hand out DNS via IPCP and no search domain is configured (auto-discovery via PTR lookup covers most of these cases).
 
 ## Contributing
