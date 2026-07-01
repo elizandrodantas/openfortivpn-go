@@ -205,15 +205,30 @@ func (t *Tunnel) connect(ctx context.Context) error {
 		})
 	}()
 
-	if err := vpnio.RunLoop(ctx, ioCfg); err != nil {
-		slog.Debug("I/O loop ended", "err", err)
+	runErr := vpnio.RunLoop(ctx, ioCfg)
+	if runErr != nil {
+		slog.Debug("I/O loop ended", "err", runErr)
+	}
+
+	// RunLoop's own error is generic (e.g. "PTY closed") because that's just
+	// the symptom of the PPP engine exiting, not the cause. By the time
+	// RunLoop has returned, the engine has already finished (its exit is
+	// what causes the PTY/pipe to close in the first place, whether that's
+	// pppd dying on Unix or the LCP/IPCP/wintun engine failing on Windows),
+	// so Wait() here returns immediately with the more specific reason —
+	// prefer it, unless this is just an expected shutdown (ctx cancelled).
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	procErr := t.pppdProc.Wait(waitCtx)
+	waitCancel()
+	if procErr != nil && ctx.Err() == nil {
+		runErr = procErr
 	}
 
 	// Cleanup network config
 	t.setState(StateDisconnecting)
 	t.teardownNetwork()
 	t.setState(StateDown)
-	return err
+	return runErr
 }
 
 // requestVPNAllocation performs the HTTP steps needed to reserve a VPN session.

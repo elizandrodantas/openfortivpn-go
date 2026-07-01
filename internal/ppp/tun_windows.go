@@ -106,6 +106,16 @@ func Start(cfg *config.Config) (*Process, error) {
 func (p *Process) run(ctx context.Context, cfg *config.Config, engineSide net.Conn) {
 	defer close(p.done)
 	defer engineSide.Close()
+	defer func() {
+		// This engine's caller (tunnel.go) may not surface Wait()'s error
+		// distinctly from the generic relay-loop error its own shutdown
+		// produces (closing engineSide causes RunLoop to fail too), so log
+		// it here directly — this must never fail silently. A cancelled
+		// context is normal shutdown (Ctrl+C / Process.Close), not a failure.
+		if p.runErr != nil && !errors.Is(p.runErr, context.Canceled) {
+			slog.Error("windows ppp: engine failed", "err", p.runErr)
+		}
+	}()
 
 	link := newWireLink(engineSide)
 	defer link.close()
@@ -361,6 +371,14 @@ func (w *wireLink) readLoop() {
 	}
 }
 
+// writeTimeout bounds every write to the link. Without it, a Write on a
+// net.Pipe() blocks until the other end reads — normally near-instant once
+// RunLoop's ptyReader is running, but with nothing else bounding it, any
+// delay in RunLoop starting (or a stall in it) would block here forever,
+// silently bypassing NegotiateLCP/NegotiateIPCP's own timeout entirely,
+// since that timeout is only checked once this call returns.
+const writeTimeout = pppproto.NegotiateTimeout
+
 // Send HDLC-encodes a raw PPP packet (see pppproto.BuildFrame) and writes it
 // to the link. hdlc.Encoder always prepends its own address+control prefix,
 // so any FF 03 already in pkt is stripped first to avoid double-framing.
@@ -369,6 +387,9 @@ func (w *wireLink) Send(pkt []byte) error {
 	frame, err := w.enc.Encode(nil, payload)
 	if err != nil {
 		return err
+	}
+	if err := w.conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+		return fmt.Errorf("set write deadline: %w", err)
 	}
 	_, err = w.conn.Write(frame)
 	return err
