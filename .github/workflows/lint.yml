@@ -2,7 +2,7 @@ name: Lint
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
     paths:
       - "**.go"
       - "go.mod"
@@ -10,6 +10,7 @@ on:
       - "Makefile"
       - ".github/workflows/lint.yml"
   pull_request:
+    branches: [main]
     paths:
       - "**.go"
       - "go.mod"
@@ -19,6 +20,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write
 
 jobs:
   lint:
@@ -35,3 +37,20 @@ jobs:
 
       - name: Run lint (go vet + staticcheck)
         run: make lint
+
+  on-failure:
+    needs: lint
+    if: failure() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Comment and close PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" \
+            --body "❌ **Lint** failed — closing this PR. See: $RUN_URL" || true
+          gh pr close "$PR_NUMBER" --repo "${{ github.repository }}" || true

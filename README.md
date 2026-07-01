@@ -82,8 +82,8 @@ Single static binaries for:
 ## Requirements
 
 - A system `pppd` binary on **Linux** and **macOS** (openfortivpn-go shells out to it, matching the original client's architecture) — e.g. `apt install ppp` / `dnf install ppp` on Linux; macOS ships `pppd` out of the box.
-- **Root/administrator privileges** — required to run `pppd`, modify the routing table, and change DNS configuration. Run with `sudo` on Linux/macOS or an elevated shell on Windows.
-- Windows: see [Known limitations](#known-limitations) — the tunnel data-plane is not yet implemented on this platform.
+- On **Windows**, the [`wintun.dll`](https://www.wintun.net/) driver must be present next to the executable (or in `System32`) — see [Known limitations](#known-limitations).
+- **Root/administrator privileges** — required to run `pppd` (or create the TUN adapter on Windows), modify the routing table, and change DNS configuration. Run with `sudo` on Linux/macOS or an elevated shell on Windows.
 
 ## Installation
 
@@ -258,8 +258,9 @@ The version string embedded in binaries (visible via `--version`) is derived fro
 | `internal/httptunnel` | Minimal hand-rolled HTTP client over the raw TLS socket, plus the local SAML callback server |
 | `internal/tunnel` | Top-level orchestration: connect → auth → XML config → pppd → relay → routes/DNS |
 | `internal/xmlparse` | Lenient parser for the gateway's `fortisslvpn_xml` response (assigned IP, DNS, split routes) |
-| `internal/ppp` | Drives the system `pppd` via a PTY (Unix); Windows TUN stub |
-| `internal/hdlc` | HDLC framing/deframing between the relay loop and the local `pppd` PTY |
+| `internal/ppp` | Drives the system `pppd` via a PTY (Unix); on Windows, drives a `wintun` adapter instead |
+| `internal/ppp/pppproto` | Minimal PPP LCP/IPCP negotiation (RFC 1661/1332), used by the Windows engine in place of pppd |
+| `internal/hdlc` | HDLC framing/deframing between the relay loop and the local PPP transport (`pppd` PTY on Unix, `wintun` engine pipe on Windows) |
 | `internal/io` | Packet framing on the wire and the bidirectional relay loop |
 | `internal/ipv4` | Per-OS routing table and DNS management (Linux/macOS/Windows) |
 | `internal/userinput` | Interactive password/OTP prompts, with optional `pinentry` support |
@@ -267,7 +268,7 @@ The version string embedded in binaries (visible via `--version`) is derived fro
 
 ## Known limitations
 
-- **Windows tunnel data-plane is not yet implemented.** `openfortivpn-go` cross-compiles for Windows and the CLI/config/auth layers work, but there is no `pppd` on Windows, so the PPP/IPCP negotiation and TUN adapter integration (planned via `wintun`) is still a stub. Windows builds will fail at the tunnel-establishment step. **Contributions welcome** — see [Contributing](#contributing).
+- **Windows support is new and needs real-world testing.** Since there's no `pppd` on Windows, `openfortivpn-go` implements its own minimal PPP client (LCP/IPCP negotiation, see `internal/ppp/pppproto`) on top of a [`wintun`](https://www.wintun.net/) virtual adapter. It requires **Administrator privileges** and the `wintun.dll` driver to be present next to the executable (or in `System32`) — it is not bundled with releases yet. If you hit issues, please open one with `-vvv --log-file` output attached.
 - macOS DNS integration writes scoped resolver entries under `/etc/resolver/<domain>` as a fallback; this is not a global default-resolver override the way the official FortiClient (a signed `NetworkExtension`) can achieve. In practice this only matters if the gateway doesn't hand out DNS via IPCP and no search domain is configured (auto-discovery via PTR lookup covers most of these cases).
 
 ## Contributing

@@ -38,12 +38,56 @@ func (m *winRouteManager) GetDefault() (*Route, error) {
 func (m *winRouteManager) Add(r Route) error {
 	dest := r.Dest.IP.String()
 	mask := net.IP(r.Dest.Mask).String()
-	gw := r.Gateway.String()
-	out, err := exec.Command("route", "ADD", dest, "MASK", mask, gw).CombinedOutput()
+
+	// Routes through the PPP/TUN interface (split-tunnel, default-route
+	// replacement, half-internet) are built with only Iface set, no
+	// Gateway — classic route.exe still requires a gateway argument, so
+	// resolve the interface's own address and use that: Windows treats a
+	// gateway matching a locally-assigned address as reachable via that
+	// interface, which is the standard way to route over a point-to-point
+	// adapter like this one.
+	gw := r.Gateway
+	if gw == nil {
+		if r.Iface == "" {
+			return fmt.Errorf("ipv4: route ADD %s: no gateway or interface specified", dest)
+		}
+		ip, err := ifaceIPv4(r.Iface)
+		if err != nil {
+			return fmt.Errorf("ipv4: route ADD %s: resolve gateway for interface %s: %w", dest, r.Iface, err)
+		}
+		gw = ip
+	}
+
+	out, err := exec.Command("route", "ADD", dest, "MASK", mask, gw.String()).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("ipv4: route ADD %s: %w (%s)", dest, err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// ifaceIPv4 returns the first IPv4 address assigned to the named interface.
+func ifaceIPv4(name string) (net.IP, error) {
+	iface, err := net.InterfaceByName(name)
+	if err != nil {
+		return nil, err
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil, err
+	}
+	for _, addr := range addrs {
+		var ip net.IP
+		switch v := addr.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if ip4 := ip.To4(); ip4 != nil {
+			return ip4, nil
+		}
+	}
+	return nil, fmt.Errorf("no IPv4 address assigned to interface %s", name)
 }
 
 func (m *winRouteManager) Delete(r Route) error {
