@@ -207,6 +207,53 @@ func TestNegotiateLCP_Timeout(t *testing.T) {
 	}
 }
 
+// TestNegotiateLCP_RetransmitsOnSilence is a regression test for a real
+// hang observed against a FortiGate gateway: the very first
+// Configure-Request went unanswered (lost, or the peer needed a moment
+// after link activation), and a send-once-and-wait implementation never
+// retried, timing out after NegotiateTimeout with no response ever seen.
+// pppd's actual behavior is retransmission-based (RFC 1661's LCP restart
+// timer, "lcp-restart" — 3s by default): retransmit the same
+// Configure-Request if nothing comes back within RestartInterval.
+func TestNegotiateLCP_RetransmitsOnSilence(t *testing.T) {
+	link := newFakeLink()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		first := link.sent(t)
+		_, payload, _ := Protocol(first)
+		cf1, _ := ParseConfigFrame(payload)
+
+		// Deliberately don't respond to the first request — simulate a lost
+		// or delayed reply — and wait for the retransmission instead.
+		select {
+		case retransmitted := <-link.toPeer:
+			_, payload2, _ := Protocol(retransmitted)
+			cf2, _ := ParseConfigFrame(payload2)
+			if cf2.Code != CodeConfigureRequest || cf2.ID != cf1.ID {
+				t.Errorf("expected retransmitted Configure-Request with same ID %d, got code=%d id=%d", cf1.ID, cf2.Code, cf2.ID)
+				return
+			}
+			ack := ConfigFrame{Code: CodeConfigureAck, ID: cf2.ID, Options: cf2.Options}
+			link.deliver(BuildFrame(ProtoLCP, ack.Marshal()))
+		case <-time.After(RestartInterval + 2*time.Second):
+			t.Error("timed out waiting for retransmission — NegotiateLCP never resent after silence")
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), RestartInterval+5*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := NegotiateLCP(ctx, link, LCPOptions{MRU: 1354}); err != nil {
+		t.Fatalf("NegotiateLCP failed: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < RestartInterval {
+		t.Errorf("completed in %s — expected to wait at least RestartInterval (%s) for the retransmit to land", elapsed, RestartInterval)
+	}
+	<-done
+}
+
 // TestNegotiateIPCP_NakThenAck mirrors the real exchange observed against a
 // FortiGate gateway: we propose 0.0.0.0, the gateway Naks with the assigned
 // address and DNS servers, we resend with those values, and get Acked.

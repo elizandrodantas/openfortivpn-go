@@ -27,6 +27,11 @@ type LCPOptions struct {
 //
 // Any LCP Echo-Request seen during negotiation is answered immediately so an
 // impatient peer doesn't give up while we're still negotiating.
+//
+// Like pppd, this is retransmission-based, not send-once-and-wait: if no
+// response of any kind arrives within RestartInterval, the current
+// Configure-Request is retransmitted unchanged. A lost or delayed first
+// reply is normal on a link that just came up, not a fatal condition.
 func NegotiateLCP(ctx context.Context, link Link, opts LCPOptions) error {
 	ctx, cancel := context.WithTimeout(ctx, NegotiateTimeout)
 	defer cancel()
@@ -42,7 +47,7 @@ func NegotiateLCP(ctx context.Context, link Link, opts LCPOptions) error {
 	var peerAckedUs bool
 	retries := 0
 	for !peerAckedUs {
-		pkt, err := link.Recv(ctx)
+		pkt, err := recvOrRetransmit(ctx, link, &retries, send)
 		if err != nil {
 			return fmt.Errorf("pppproto: LCP negotiation: %w", err)
 		}

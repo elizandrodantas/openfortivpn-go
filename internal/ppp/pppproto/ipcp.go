@@ -55,7 +55,7 @@ func NegotiateIPCP(ctx context.Context, link Link, opts IPCPOptions) (IPCPResult
 	var peerAckedUs bool
 	retries := 0
 	for !peerAckedUs {
-		pkt, err := link.Recv(ctx)
+		pkt, err := recvOrRetransmit(ctx, link, &retries, send)
 		if err != nil {
 			return IPCPResult{}, fmt.Errorf("pppproto: IPCP negotiation: %w", err)
 		}
