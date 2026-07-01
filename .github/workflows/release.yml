@@ -1,0 +1,140 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Determine tag range
+        id: tags
+        run: |
+          set -euo pipefail
+          CURRENT_TAG="${GITHUB_REF_NAME}"
+          PREV_TAG="$(git describe --tags --abbrev=0 "${CURRENT_TAG}^" 2>/dev/null || true)"
+          echo "current_tag=${CURRENT_TAG}" >> "$GITHUB_OUTPUT"
+          echo "prev_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+
+      # Builds CHANGELOG_BODY.md from Conventional Commits between the previous
+      # tag and this one, grouped by type in this fixed order: feat, chore, fix,
+      # then any other conventional types in the order first encountered, then
+      # a final "Other Changes" bucket for anything that doesn't match the
+      # Conventional Commits pattern.
+      - name: Generate changelog
+        env:
+          CURRENT_TAG: ${{ steps.tags.outputs.current_tag }}
+          PREV_TAG: ${{ steps.tags.outputs.prev_tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${PREV_TAG}" ]; then
+            RANGE="${PREV_TAG}..${CURRENT_TAG}"
+          else
+            RANGE="${CURRENT_TAG}"
+          fi
+
+          WORKDIR="$(mktemp -d)"
+
+          declare -A TYPE_LABELS=(
+            [feat]="✨ Features"
+            [chore]="🧹 Chores"
+            [fix]="🐛 Bug Fixes"
+            [build]="📦 Build System"
+            [ci]="⚙️ CI"
+            [docs]="📝 Documentation"
+            [perf]="⚡ Performance"
+            [refactor]="♻️ Refactors"
+            [revert]="⏪ Reverts"
+            [style]="🎨 Style"
+            [test]="✅ Tests"
+            [other]="📋 Other Changes"
+          )
+
+          declare -a EXTRA_ORDER=()
+
+          # Conventional Commits subject pattern: "type(scope)!: description".
+          # Kept in a variable (rather than inlined) because unescaped parens
+          # in an inline =~ pattern confuse bash's own word parser.
+          COMMIT_PATTERN='^([a-zA-Z]+)(\([^)]*\))?(!)?:[[:space:]]*(.*)$'
+
+          # %x1f inserts a literal unit-separator byte, safe to split on
+          # (commit subjects won't contain it).
+          # The `|| [ -n "${subject}" ]` keeps the last line: git log's output
+          # has no trailing newline, so a plain `read` loop silently drops it.
+          while IFS=$'\x1f' read -r subject hash || [ -n "${subject}" ]; do
+            [ -z "${subject}" ] && continue
+            if [[ "${subject}" =~ ${COMMIT_PATTERN} ]]; then
+              rawtype="${BASH_REMATCH[1],,}"
+              desc="${BASH_REMATCH[4]}"
+            else
+              rawtype="other"
+              desc="${subject}"
+            fi
+            if [[ -z "${TYPE_LABELS[${rawtype}]+x}" ]]; then
+              rawtype="other"
+              desc="${subject}"
+            fi
+            echo "- ${desc} (${hash})" >> "${WORKDIR}/${rawtype}.md"
+            if [[ "${rawtype}" != "feat" && "${rawtype}" != "chore" && "${rawtype}" != "fix" && "${rawtype}" != "other" ]]; then
+              if [[ ! " ${EXTRA_ORDER[*]:-} " == *" ${rawtype} "* ]]; then
+                EXTRA_ORDER+=("${rawtype}")
+              fi
+            fi
+          done < <(git log "${RANGE}" --no-merges --pretty=format:'%s%x1f%h')
+
+          {
+            echo "## What's changed in ${CURRENT_TAG}"
+            echo
+            if [ -n "${PREV_TAG}" ]; then
+              echo "_Changes since ${PREV_TAG}._"
+            else
+              echo "_Initial release._"
+            fi
+            echo
+
+            for t in feat chore fix "${EXTRA_ORDER[@]}" other; do
+              if [ -f "${WORKDIR}/${t}.md" ]; then
+                echo "### ${TYPE_LABELS[${t}]}"
+                echo
+                cat "${WORKDIR}/${t}.md"
+                echo
+              fi
+            done
+
+            echo "---"
+            echo
+            echo "**Full diff**: https://github.com/${GITHUB_REPOSITORY}/compare/${PREV_TAG:-${CURRENT_TAG}}...${CURRENT_TAG}"
+          } > CHANGELOG_BODY.md
+
+          cat CHANGELOG_BODY.md
+
+      - name: Build release binaries
+        env:
+          CURRENT_TAG: ${{ steps.tags.outputs.current_tag }}
+        run: make dist VERSION="${CURRENT_TAG}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tags.outputs.current_tag }}
+          name: ${{ steps.tags.outputs.current_tag }}
+          body_path: CHANGELOG_BODY.md
+          files: dist/*
+          fail_on_unmatched_files: true

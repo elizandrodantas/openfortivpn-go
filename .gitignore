@@ -1,0 +1,8 @@
+/openfortivpn-go
+/openfortivpn
+*.exe
+*.test
+*.out
+vendor/
+dist/
+.claude/
