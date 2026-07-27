@@ -146,6 +146,18 @@ func buildTLSConfig(cfg *config.Config) (*tls.Config, error) {
 		},
 	}
 
+	// Standard SSLKEYLOGFILE support (same env var Chrome/Firefox/curl/OpenSSL
+	// honor) — opt-in only, for decrypting our own captured traffic in
+	// Wireshark while debugging the PPP-over-TLS exchange. Does nothing
+	// unless the env var is set.
+	if keylogPath := os.Getenv("SSLKEYLOGFILE"); keylogPath != "" {
+		f, err := os.OpenFile(keylogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		if err != nil {
+			return nil, fmt.Errorf("open SSLKEYLOGFILE %s: %w", keylogPath, err)
+		}
+		tlsCfg.KeyLogWriter = f
+	}
+
 	// Client certificate (PEM files)
 	if cfg.UserCert != "" && !strings.HasPrefix(cfg.UserCert, "pkcs11:") {
 		cert, err := tls.LoadX509KeyPair(cfg.UserCert, cfg.UserKey)

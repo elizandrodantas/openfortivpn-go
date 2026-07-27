@@ -194,8 +194,13 @@ func rootCmd() *cobra.Command {
 				return err
 			}
 
-			// Handle OS signals for clean shutdown
-			ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+			// Handle OS signals for clean shutdown. SIGHUP is included because
+			// closing the controlling terminal (e.g. closing the Terminal
+			// window/tab this process is attached to) sends SIGHUP, and an
+			// uncaught SIGHUP kills the process before any defer runs — leaving
+			// pppd (and on macOS the com.apple.nke.ppp kernel extension it
+			// drives) orphaned with the tunnel still up.
+			ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 			defer cancel()
 
 			slog.Info("openfortivpn-go starting", "version", version.Version)

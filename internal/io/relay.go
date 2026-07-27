@@ -73,32 +73,34 @@ func RunLoop(ctx context.Context, cfg *LoopConfig) error {
 	go func() { defer wg.Done(); ptyWriter(ctx, cfg, sslToPTY, pptdReadyCh, errCh) }()
 	go func() { defer wg.Done(); ifConfigMonitor(ctx, cfg, ipcpCh, errCh) }()
 
-	// When context is cancelled (Ctrl+C / SIGTERM), unblock goroutines stuck in
-	// blocking I/O: set an expired TLS deadline (unblocks sslReader/sslWriter)
-	// and call OnCancel (kills pppd → PTY EOF → unblocks ptyReader).
-	// If an I/O error fires first, close stoppedCh to let the watcher exit.
-	stoppedCh := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = cfg.TLSConn.SetDeadline(cancelDeadline)
-			if cfg.OnCancel != nil {
-				cfg.OnCancel()
-			}
-		case <-stoppedCh:
+	// Whichever path triggers shutdown — an error from any one goroutine, or
+	// external ctx cancellation (Ctrl+C / SIGTERM) — force-unblock the other
+	// four before wg.Wait(): set an expired TLS deadline (unblocks
+	// sslReader/sslWriter) and call OnCancel (kills pppd/engine → PTY EOF →
+	// unblocks ptyReader). This used to run in a separate goroutine racing
+	// against a "stopped" signal from the errCh path, but close() on that
+	// signal happened before cancel() in program order, so the watcher
+	// almost always won the race and exited without ever unblocking
+	// anything — leaving sslReader blocked on the TLS socket until the
+	// gateway's own idle-timeout (which can be minutes) closed it for us.
+	unblock := func() {
+		_ = cfg.TLSConn.SetDeadline(cancelDeadline)
+		if cfg.OnCancel != nil {
+			cfg.OnCancel()
 		}
-	}()
+	}
 
 	select {
 	case err := <-errCh:
-		close(stoppedCh)
 		cancel()
+		unblock()
 		wg.Wait()
 		if err != nil {
 			return fmt.Errorf("io: relay: %w", err)
 		}
 		return nil
 	case <-ctx.Done():
+		unblock()
 		wg.Wait()
 		return ctx.Err()
 	}

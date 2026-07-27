@@ -30,6 +30,13 @@ type IPCPResult struct {
 // pppd's "noipdefault ipcp-accept-local" behavior. We don't support Van
 // Jacobson header compression, so an IP-Compression-Protocol option in the
 // peer's own Configure-Request is rejected.
+//
+// It's typically run concurrently with NegotiateLCP (see Demux) rather than
+// after LCP completes: comparing a packet capture of a working client
+// against ours showed LCP and IPCP Configure-Requests going out together
+// from the start, not sequentially — some gateways don't necessarily
+// finish LCP before they'll process IPCP, so waiting for that can mean
+// waiting on a peer that already sent its (unanswered) IPCP reply.
 func NegotiateIPCP(ctx context.Context, link Link, opts IPCPOptions) (IPCPResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, NegotiateTimeout)
 	defer cancel()
@@ -54,35 +61,15 @@ func NegotiateIPCP(ctx context.Context, link Link, opts IPCPOptions) (IPCPResult
 	var result IPCPResult
 	var peerAckedUs bool
 	retries := 0
+	rt := newRetransmitter(&retries, send)
 	for !peerAckedUs {
-		pkt, err := recvOrRetransmit(ctx, link, &retries, send)
+		pkt, err := rt.recv(ctx, link)
 		if err != nil {
 			return IPCPResult{}, fmt.Errorf("pppproto: IPCP negotiation: %w", err)
 		}
 		proto, payload, ok := Protocol(pkt)
-		if !ok {
-			continue
-		}
-		if proto == ProtoLCP {
-			// A late LCP Echo-Request/Configure-Request during IPCP
-			// negotiation; answer it so the peer doesn't time out waiting
-			// on us or think LCP itself dropped.
-			if cf, err := ParseConfigFrame(payload); err == nil {
-				switch cf.Code {
-				case CodeEchoRequest:
-					if ef, ok := ParseEchoFrame(payload); ok {
-						reply := EchoFrame{Code: CodeEchoReply, ID: ef.ID, Magic: ef.Magic}
-						_ = link.Send(BuildFrame(ProtoLCP, reply.Marshal()))
-					}
-				case CodeConfigureRequest:
-					resp, _ := reviewPeerLCPRequest(cf)
-					_ = link.Send(BuildFrame(ProtoLCP, resp.Marshal()))
-				}
-			}
-			continue
-		}
-		if proto != ProtoIPCP {
-			continue
+		if !ok || proto != ProtoIPCP {
+			continue // not IPCP (e.g. LCP, routed elsewhere by Demux) — ignore
 		}
 		cf, err := ParseConfigFrame(payload)
 		if err != nil {
@@ -120,7 +107,7 @@ func NegotiateIPCP(ctx context.Context, link Link, opts IPCPOptions) (IPCPResult
 			}
 			proposed.applyNak(cf)
 			id++
-			if err := send(); err != nil {
+			if err := rt.resendNow(); err != nil {
 				return IPCPResult{}, fmt.Errorf("pppproto: IPCP: %w", err)
 			}
 
@@ -134,7 +121,7 @@ func NegotiateIPCP(ctx context.Context, link Link, opts IPCPOptions) (IPCPResult
 			}
 			proposed.applyReject(cf)
 			id++
-			if err := send(); err != nil {
+			if err := rt.resendNow(); err != nil {
 				return IPCPResult{}, fmt.Errorf("pppproto: IPCP: %w", err)
 			}
 		}

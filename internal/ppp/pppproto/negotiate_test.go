@@ -254,6 +254,80 @@ func TestNegotiateLCP_RetransmitsOnSilence(t *testing.T) {
 	<-done
 }
 
+// TestNegotiateLCP_RetransmitsDespiteUnrelatedTraffic is a regression test
+// for a second, more insidious real hang: a naive "wait RestartInterval
+// since the last packet, then retransmit" reset its clock on ANY received
+// packet, not just a matching response. If the peer sends anything at all
+// more often than RestartInterval — an Echo-Request keepalive, a frame for
+// a different protocol — the retransmit deadline kept getting silently
+// pushed out forever, and a genuinely unanswered Configure-Request would
+// just sit there until NegotiateTimeout with zero retransmissions ever
+// sent. The retransmit deadline must be anchored to the last time *we*
+// sent something, independent of unrelated incoming traffic.
+func TestNegotiateLCP_RetransmitsDespiteUnrelatedTraffic(t *testing.T) {
+	link := newFakeLink()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		first := link.sent(t)
+		_, payload, _ := Protocol(first)
+		cf1, _ := ParseConfigFrame(payload)
+
+		// Flood irrelevant Echo-Requests faster than RestartInterval,
+		// without ever acking the Configure-Request — this must not
+		// prevent retransmission.
+		stop := time.After(RestartInterval + 1*time.Second)
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+	flood:
+		for {
+			select {
+			case <-ticker.C:
+				echo := EchoFrame{Code: CodeEchoRequest, ID: 9, Magic: 0x1234}
+				link.deliver(BuildFrame(ProtoLCP, echo.Marshal()))
+			case <-stop:
+				break flood
+			}
+		}
+
+		// Now expect the retransmitted Configure-Request (same ID, content
+		// unchanged) and Ack it — skipping over the Echo-Replies NegotiateLCP
+		// correctly sent for each flooded Echo-Request.
+		var cf2 ConfigFrame
+		for {
+			pkt := link.sent(t)
+			_, payload2, _ := Protocol(pkt)
+			parsed, _ := ParseConfigFrame(payload2)
+			if parsed.Code == CodeEchoReply {
+				continue
+			}
+			cf2 = parsed
+			break
+		}
+		if cf2.Code != CodeConfigureRequest || cf2.ID != cf1.ID {
+			t.Errorf("expected retransmitted Configure-Request with same ID %d, got code=%d id=%d", cf1.ID, cf2.Code, cf2.ID)
+			return
+		}
+		ack := ConfigFrame{Code: CodeConfigureAck, ID: cf2.ID, Options: cf2.Options}
+		link.deliver(BuildFrame(ProtoLCP, ack.Marshal()))
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), RestartInterval+6*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := NegotiateLCP(ctx, link, LCPOptions{MRU: 1354}); err != nil {
+		t.Fatalf("NegotiateLCP failed: %v", err)
+	}
+	// Should complete shortly after the flood stops and the retransmit
+	// lands — NOT after multiples of RestartInterval, which is what
+	// happens if unrelated packets keep resetting the retransmit deadline.
+	if elapsed := time.Since(start); elapsed > RestartInterval+4*time.Second {
+		t.Errorf("took %s — unrelated traffic appears to have reset the retransmit deadline", elapsed)
+	}
+	<-done
+}
+
 // TestNegotiateIPCP_NakThenAck mirrors the real exchange observed against a
 // FortiGate gateway: we propose 0.0.0.0, the gateway Naks with the assigned
 // address and DNS servers, we resend with those values, and get Acked.

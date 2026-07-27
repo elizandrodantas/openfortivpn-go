@@ -96,14 +96,14 @@ func Start(cfg *config.Config) (*Process, error) {
 		done:    make(chan struct{}),
 	}
 
-	go p.run(ctx, cfg, engineSide)
+	go p.run(ctx, engineSide)
 
 	return p, nil
 }
 
 // run negotiates LCP/IPCP, configures the adapter's IP address, then relays
 // steady-state IPv4 traffic until ctx is cancelled or a fatal error occurs.
-func (p *Process) run(ctx context.Context, cfg *config.Config, engineSide net.Conn) {
+func (p *Process) run(ctx context.Context, engineSide net.Conn) {
 	defer close(p.done)
 	defer engineSide.Close()
 	defer func() {
@@ -120,19 +120,47 @@ func (p *Process) run(ctx context.Context, cfg *config.Config, engineSide net.Co
 	link := newWireLink(engineSide)
 	defer link.close()
 
-	slog.Debug("windows ppp: negotiating LCP")
-	if err := pppproto.NegotiateLCP(ctx, link, pppproto.LCPOptions{MRU: 1354}); err != nil {
-		p.runErr = fmt.Errorf("ppp: LCP negotiation: %w", err)
-		return
-	}
+	// LCP and IPCP negotiate concurrently, not sequentially: comparing a
+	// packet capture of a real, working client against ours showed LCP and
+	// IPCP Configure-Requests going out together from the start. Some
+	// gateways don't necessarily finish LCP before they'll process IPCP —
+	// negotiating strictly in sequence can mean waiting on a peer that
+	// already sent its (unanswered) IPCP reply. Demux routes each protocol's
+	// packets to its own negotiation so they don't race for the same Recv.
+	demux := pppproto.NewDemux(ctx, link)
+	slog.Debug("windows ppp: negotiating LCP and IPCP concurrently")
 
-	slog.Debug("windows ppp: negotiating IPCP")
-	result, err := pppproto.NegotiateIPCP(ctx, link, pppproto.IPCPOptions{RequestDNS: cfg.PPPDUsePeerDNS || true})
-	if err != nil {
-		p.runErr = fmt.Errorf("ppp: IPCP negotiation: %w", err)
+	var lcpErr, ipcpErr error
+	var result pppproto.IPCPResult
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		lcpErr = pppproto.NegotiateLCP(ctx, demux.Link(pppproto.ProtoLCP), pppproto.LCPOptions{MRU: 1354})
+	}()
+	go func() {
+		defer wg.Done()
+		// Don't request DNS via IPCP: unlike Unix (where usepeerdns is a
+		// pppd flag feeding the generic IPCP-sniffing in relay.go),
+		// tunnel.go's onIPCPComplete already prefers the DNS servers parsed
+		// from the gateway's XML config over anything IPCP negotiates, so
+		// this isn't needed for Windows — and it's one less thing that could
+		// make our Configure-Request look unlike the minimal one some
+		// gateways expect (some may not answer at all if they get options
+		// they don't recognize unsolicited, rather than rejecting them).
+		result, ipcpErr = pppproto.NegotiateIPCP(ctx, demux.Link(pppproto.ProtoIPCP), pppproto.IPCPOptions{})
+	}()
+	wg.Wait()
+
+	if lcpErr != nil {
+		p.runErr = fmt.Errorf("ppp: LCP negotiation: %w", lcpErr)
 		return
 	}
-	slog.Info("windows ppp: IPCP negotiated", "local", result.LocalIP, "peer", result.PeerIP, "dns1", result.DNS1, "dns2", result.DNS2)
+	if ipcpErr != nil {
+		p.runErr = fmt.Errorf("ppp: IPCP negotiation: %w", ipcpErr)
+		return
+	}
+	slog.Info("windows ppp: LCP+IPCP negotiated", "local", result.LocalIP, "peer", result.PeerIP, "dns1", result.DNS1, "dns2", result.DNS2)
 
 	if err := configureAdapterAddress(p.ifName, result.LocalIP); err != nil {
 		p.runErr = fmt.Errorf("ppp: configure adapter address: %w", err)
@@ -310,10 +338,16 @@ func configureAdapterAddress(ifName string, localIP net.IP) error {
 // PTY would produce.
 type wireLink struct {
 	conn net.Conn
-	enc  *hdlc.Encoder // shared across the session — see hdlc.NewEncoder doc
 
-	in     chan []byte
-	readMu sync.Mutex
+	// sendMu serializes Send: hdlc.Encoder is stateful (its leading-flag
+	// tracking) and explicitly not safe for concurrent use, and now that
+	// LCP and IPCP negotiate concurrently (see Demux), both call Send on
+	// this same wireLink from separate goroutines.
+	sendMu sync.Mutex
+	enc    *hdlc.Encoder // shared across the session — see hdlc.NewEncoder doc
+
+	in      chan []byte
+	readMu  sync.Mutex
 	readErr error
 	closed  chan struct{}
 }
@@ -383,6 +417,9 @@ const writeTimeout = pppproto.NegotiateTimeout
 // to the link. hdlc.Encoder always prepends its own address+control prefix,
 // so any FF 03 already in pkt is stripped first to avoid double-framing.
 func (w *wireLink) Send(pkt []byte) error {
+	w.sendMu.Lock()
+	defer w.sendMu.Unlock()
+
 	payload := pppproto.StripPrefix(pkt)
 	frame, err := w.enc.Encode(nil, payload)
 	if err != nil {

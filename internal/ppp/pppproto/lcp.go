@@ -46,8 +46,9 @@ func NegotiateLCP(ctx context.Context, link Link, opts LCPOptions) error {
 
 	var peerAckedUs bool
 	retries := 0
+	rt := newRetransmitter(&retries, send)
 	for !peerAckedUs {
-		pkt, err := recvOrRetransmit(ctx, link, &retries, send)
+		pkt, err := rt.recv(ctx, link)
 		if err != nil {
 			return fmt.Errorf("pppproto: LCP negotiation: %w", err)
 		}
@@ -85,7 +86,7 @@ func NegotiateLCP(ctx context.Context, link Link, opts LCPOptions) error {
 			}
 			applyLCPFeedback(&opts, cf, cf.Code == CodeConfigureReject)
 			id++
-			if err := send(); err != nil {
+			if err := rt.resendNow(); err != nil {
 				return fmt.Errorf("pppproto: LCP: %w", err)
 			}
 

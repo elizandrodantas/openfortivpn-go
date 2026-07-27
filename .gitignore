@@ -6,3 +6,7 @@
 vendor/
 dist/
 .claude/
+*.pcap
+*.pcapng
+keylog.txt
+*.keylog

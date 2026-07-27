@@ -62,7 +62,9 @@ DNS handling is implemented per-platform to match each OS's native mechanisms as
 ### Reliability & operations
 
 - **Persistent reconnection** — `--persistent <seconds>` automatically reconnects after a disconnect instead of exiting, with a configurable delay between attempts.
-- **Clean shutdown** — `Ctrl+C` (SIGINT) or SIGTERM tear down routes/DNS and terminate `pppd` gracefully before the process exits.
+- **Clean shutdown** — `Ctrl+C` (SIGINT), SIGTERM, or SIGHUP (e.g. closing the terminal window the process is attached to) tear down routes/DNS and terminate `pppd` gracefully before the process exits.
+- **Orphaned `pppd` cleanup (Unix)** — the PID of the launched `pppd` is tracked in `/var/run/openfortivpn-go.pppd.pid`. If a previous run was killed non-gracefully (`kill -9`, crash, abrupt system sleep) and left `pppd` running, the next run detects and terminates it before starting a new session — avoiding two PPP sessions competing for the same OS-level PPP link.
+- **macOS: prevents idle sleep while connected** — shells out to `caffeinate -s -w <pid>` for the lifetime of the tunnel, so the Mac won't go to sleep with the PPP link (and the legacy `com.apple.nke.ppp` kernel extension it depends on) active. The assertion is tied to the process PID, so it's automatically released even if the process dies unexpectedly.
 - **Configuration file** — every CLI flag has an equivalent config-file key, using the same INI-style format and default path (`/etc/openfortivpn/config`) as the original client. See [Configuration file](#configuration-file).
 - **Flexible logging**:
   - `-v` / `-vv` / `-vvv` — progressively more verbose console output.

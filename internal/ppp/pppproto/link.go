@@ -37,15 +37,35 @@ const RestartInterval = 3 * time.Second
 // this spans the bulk of NegotiateTimeout.
 const maxConfigureRetries = 20
 
-// recvOrRetransmit waits for the next packet, retransmitting the current
-// Configure-Request (via send, unchanged) if nothing arrives within
-// RestartInterval — see NegotiateLCP's doc comment for why this matters.
-// retries is shared with the caller's Nak/Reject-triggered retransmission
-// counter so both are bounded by the same budget.
-func recvOrRetransmit(ctx context.Context, link Link, retries *int, send func() error) ([]byte, error) {
+// retransmitter tracks when the next Configure-Request retransmission is
+// due, across an entire negotiation — not per receive attempt. This matters:
+// a naive "wait RestartInterval, retransmit" reset on every call would never
+// fire if the peer sends anything at all more often than RestartInterval
+// (an Echo-Request keepalive, a frame for a different protocol, a late LCP
+// Configure-Request during IPCP negotiation) — the deadline would keep
+// getting silently pushed out by unrelated traffic, and a genuinely
+// unanswered request would just sit there until NegotiateTimeout with zero
+// retransmissions ever sent. Retries is a pointer so Nak/Reject-triggered
+// retransmissions (handled by the caller, which also resends) share the
+// same budget and correctly push the next deadline out too.
+type retransmitter struct {
+	next    time.Time
+	retries *int
+	send    func() error
+}
+
+func newRetransmitter(retries *int, send func() error) *retransmitter {
+	return &retransmitter{next: time.Now().Add(RestartInterval), retries: retries, send: send}
+}
+
+// recv waits for the next packet up to the current retransmit deadline. If
+// the deadline passes with nothing received, it retransmits and extends the
+// deadline; receiving (and the caller ignoring) an irrelevant packet does
+// not reset it.
+func (r *retransmitter) recv(ctx context.Context, link Link) ([]byte, error) {
 	for {
-		waitCtx, cancel := context.WithTimeout(ctx, RestartInterval)
-		pkt, err := link.Recv(waitCtx)
+		recvCtx, cancel := context.WithDeadline(ctx, r.next)
+		pkt, err := link.Recv(recvCtx)
 		cancel()
 		if err == nil {
 			return pkt, nil
@@ -56,12 +76,25 @@ func recvOrRetransmit(ctx context.Context, link Link, retries *int, send func() 
 		if !errors.Is(err, context.DeadlineExceeded) {
 			return nil, err // a real failure (e.g. link closed), not a retransmit signal
 		}
-		*retries++
-		if *retries > maxConfigureRetries {
+		*r.retries++
+		if *r.retries > maxConfigureRetries {
 			return nil, errors.New("no response from peer after repeated retransmissions")
 		}
-		if err := send(); err != nil {
+		if err := r.send(); err != nil {
 			return nil, err
 		}
+		r.next = time.Now().Add(RestartInterval)
 	}
+}
+
+// resendNow retransmits immediately (e.g. after adjusting options in
+// response to a Nak/Reject) and pushes the retransmit deadline back out,
+// so an imminent timeout-triggered retransmit doesn't immediately follow
+// with the same content.
+func (r *retransmitter) resendNow() error {
+	if err := r.send(); err != nil {
+		return err
+	}
+	r.next = time.Now().Add(RestartInterval)
+	return nil
 }

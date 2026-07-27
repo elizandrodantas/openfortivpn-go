@@ -6,6 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
+	"os/exec"
+	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -158,6 +162,25 @@ func (t *Tunnel) connect(ctx context.Context) error {
 			t.pppdProc = nil
 		}
 	}()
+
+	// On macOS, prevent idle system sleep while the tunnel is up: sleeping
+	// with the PPP link active (and the legacy com.apple.nke.ppp kernel
+	// extension it depends on) still up is one of the ways that link can end
+	// up in an inconsistent state. "-w <pid>" ties the assertion to our own
+	// process, so it disappears on its own even if we die abruptly instead
+	// of leaving the system unable to sleep forever.
+	if runtime.GOOS == "darwin" {
+		caffeinate := exec.Command("caffeinate", "-s", "-w", strconv.Itoa(os.Getpid()))
+		if err := caffeinate.Start(); err != nil {
+			slog.Debug("could not start caffeinate", "err", err)
+		} else {
+			defer func() {
+				if caffeinate.Process != nil {
+					caffeinate.Process.Kill() //nolint:errcheck
+				}
+			}()
+		}
+	}
 
 	// Step 7: Activate tunnel (upgrade connection to PPP carrier)
 	slog.Info("Activating VPN tunnel")
