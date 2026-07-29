@@ -32,9 +32,17 @@ var pppdSignature = []string{"230400", ":169.254.2.1", "lcp-max-configure"}
 
 // Process wraps a running pppd subprocess and its PTY master.
 type Process struct {
-	cmd        *exec.Cmd
-	master     *os.File
-	closeOnce  sync.Once
+	cmd       *exec.Cmd
+	master    *os.File
+	closeOnce sync.Once
+
+	// waitDone is closed exactly once, after cmd.Wait() returns, by the
+	// reaper goroutine started in Start(). Close() and Wait() both read
+	// from this instead of calling cmd.Wait() themselves, since Cmd.Wait
+	// must only ever be called once and both methods need to observe the
+	// same "has pppd actually exited yet" state.
+	waitDone chan struct{}
+	waitErr  error
 }
 
 // PTY returns the PTY master file, used by the I/O relay goroutines.
@@ -66,35 +74,57 @@ func Start(cfg *config.Config) (*Process, error) {
 	if err := os.WriteFile(pidFilePath, []byte(strconv.Itoa(cmd.Process.Pid)), 0644); err != nil {
 		slog.Warn("could not write pppd pid file", "path", pidFilePath, "err", err)
 	}
-	return &Process{cmd: cmd, master: master}, nil
+
+	p := &Process{cmd: cmd, master: master, waitDone: make(chan struct{})}
+	go func() {
+		p.waitErr = cmd.Wait()
+		close(p.waitDone)
+	}()
+	return p, nil
 }
 
 // Wait waits for pppd to exit, respecting context cancellation.
 func (p *Process) Wait(ctx context.Context) error {
-	done := make(chan error, 1)
-	go func() {
-		done <- p.cmd.Wait()
-	}()
 	select {
-	case err := <-done:
-		return interpretExitError(err)
+	case <-p.waitDone:
+		return interpretExitError(p.waitErr)
 	case <-ctx.Done():
 		p.cmd.Process.Signal(syscall.SIGTERM) //nolint:errcheck
 		select {
-		case <-done:
+		case <-p.waitDone:
 		case <-time.After(3 * time.Second):
 			p.cmd.Process.Kill() //nolint:errcheck
-			<-done
+			<-p.waitDone
 		}
 		return ctx.Err()
 	}
 }
 
 // Close terminates pppd and closes the PTY master. Safe to call multiple times.
+//
+// It waits for pppd to actually exit before closing the PTY master. pppd's
+// SIGTERM handler runs its own LCP/IPCP "down" negotiation and kernel-level
+// detach ioctls against the PPP unit attached to this tty; closing the master
+// concurrently with that independently triggers the kernel tty layer's own
+// hang-up notification to the same PPP line discipline. Two independent
+// teardown paths racing the same kernel PPP state is the kind of
+// double-teardown that can wedge or crash the legacy com.apple.nke.ppp kext
+// on macOS, so we let pppd finish exiting on its own (escalating to SIGKILL
+// only if it doesn't) before severing the tty.
 func (p *Process) Close() {
 	p.closeOnce.Do(func() {
 		if p.cmd.Process != nil {
 			p.cmd.Process.Signal(syscall.SIGTERM) //nolint:errcheck
+			select {
+			case <-p.waitDone:
+			case <-time.After(3 * time.Second):
+				p.cmd.Process.Kill() //nolint:errcheck
+				select {
+				case <-p.waitDone:
+				case <-time.After(3 * time.Second):
+					slog.Warn("pppd did not exit after SIGKILL, closing PTY anyway")
+				}
+			}
 		}
 		p.master.Close()
 		os.Remove(pidFilePath) //nolint:errcheck
