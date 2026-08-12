@@ -3,6 +3,7 @@ package tunnel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -49,6 +50,8 @@ type Tunnel struct {
 
 	// Saved default route for restoration on disconnect
 	savedDefault *ipv4.Route
+	// Gateway host route added in setupRoutes, removed on disconnect
+	savedGatewayRoute *ipv4.Route
 }
 
 // Run establishes (and optionally reconnects) the VPN tunnel. It blocks until
@@ -453,6 +456,8 @@ func (t *Tunnel) setupRoutes(iface string, defRoute *ipv4.Route) {
 		}
 		if err := t.routes.Add(gwRoute); err != nil {
 			slog.Warn("failed to add gateway host route", "err", err)
+		} else {
+			t.savedGatewayRoute = &gwRoute
 		}
 	}
 
@@ -492,20 +497,47 @@ func (t *Tunnel) setupRoutes(iface string, defRoute *ipv4.Route) {
 // teardownNetwork restores routing and DNS to their pre-VPN state.
 func (t *Tunnel) teardownNetwork() {
 	cfg := t.cfg
+	restoreFailed := false
 
 	if cfg.SetDNS {
 		if err := t.dns.Remove(t.ipv4Cfg.NS1, t.ipv4Cfg.NS2, t.ipv4Cfg.DNSSuffix); err != nil {
 			slog.Warn("failed to restore DNS", "err", err)
+			restoreFailed = true
 		}
+	}
+
+	if t.savedGatewayRoute != nil {
+		if err := t.routes.Delete(*t.savedGatewayRoute); err != nil && !errors.Is(err, ipv4.ErrNoSuchRoute) {
+			slog.Warn("failed to remove gateway host route", "err", err)
+		}
+		t.savedGatewayRoute = nil
 	}
 
 	if cfg.SetRoutes && t.savedDefault != nil {
 		// Only restore default route when we replaced it (no split routes, no half-internet).
 		if len(t.ipv4Cfg.SplitRoutes) == 0 && !cfg.HalfInternetRoutes {
-			t.routes.Add(*t.savedDefault) //nolint:errcheck
+			// The PPP-side default route may still be present in the kernel
+			// table (e.g. after an abrupt disconnect, since pppd runs with
+			// nodefaultroute and never touches routes itself). Clear it
+			// first so restoring the original default doesn't fail with
+			// "route already exists" and get silently swallowed, leaving a
+			// dead default route that breaks every subsequent connection.
+			defaultRoute := ipv4.Route{Dest: net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}}
+			if err := t.routes.Delete(defaultRoute); err != nil && !errors.Is(err, ipv4.ErrNoSuchRoute) {
+				slog.Warn("failed to clear default route before restore", "err", err)
+			}
+			if err := t.routes.Add(*t.savedDefault); err != nil {
+				slog.Warn("failed to restore default route", "route", t.savedDefault, "err", err)
+				restoreFailed = true
+			}
 		}
 	}
-	slog.Info("Network configuration restored")
+
+	if restoreFailed {
+		slog.Warn("network configuration restore incomplete; routing table may need manual fixing")
+	} else {
+		slog.Info("Network configuration restored")
+	}
 }
 
 func (t *Tunnel) setState(s TunnelState) {
