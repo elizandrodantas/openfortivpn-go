@@ -122,7 +122,21 @@ func (p *Process) Close() {
 				select {
 				case <-p.waitDone:
 				case <-time.After(3 * time.Second):
-					slog.Warn("pppd did not exit after SIGKILL, closing PTY anyway")
+					// pppd is still not reaped, likely blocked in an
+					// uninterruptible kernel call inside com.apple.nke.ppp.
+					// Closing the PTY master now would race that in-flight
+					// kernel-level detach — exactly the double-teardown this
+					// function exists to avoid. Defer the actual close to
+					// whenever pppd does eventually get reaped instead of
+					// forcing it while its kernel state is unknown; a
+					// temporarily leaked fd is preferable to a kernel panic.
+					slog.Warn("pppd did not exit after SIGKILL, deferring PTY close until it actually reaps")
+					go func() {
+						<-p.waitDone
+						p.master.Close()
+						os.Remove(pidFilePath) //nolint:errcheck
+					}()
+					return
 				}
 			}
 		}
@@ -167,7 +181,13 @@ func cleanupOrphan() error {
 
 	slog.Warn("found orphaned pppd from a previous session, terminating", "pid", pid)
 	syscall.Kill(pid, syscall.SIGTERM) //nolint:errcheck
-	for i := 0; i < 30; i++ {
+	// Give pppd a generous window to finish its own LCP/IPCP "down"
+	// negotiation and kernel-level detach before we consider escalating to
+	// SIGKILL, which would skip that negotiation entirely and force the
+	// kernel to tear down an orphaned PPP unit out from under an active
+	// link state — the kind of abrupt detach that can wedge or crash the
+	// legacy com.apple.nke.ppp kext.
+	for range 100 {
 		if syscall.Kill(pid, 0) != nil {
 			break
 		}
@@ -250,6 +270,10 @@ func buildArgs(cfg *config.Config) []string {
 	if cfg.PPPDAcceptRemote {
 		args = append(args, "ipcp-accept-remote")
 	}
+	// Passthrough for one-off diagnostics (e.g. testing a different mru or
+	// lcp-echo-interval/failure without a rebuild); always applied last so it
+	// can override any option set above.
+	args = append(args, cfg.PPPDExtraArgs...)
 
 	return args
 }

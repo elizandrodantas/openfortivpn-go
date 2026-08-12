@@ -65,6 +65,7 @@ DNS handling is implemented per-platform to match each OS's native mechanisms as
 - **Clean shutdown** — `Ctrl+C` (SIGINT), SIGTERM, or SIGHUP (e.g. closing the terminal window the process is attached to) tear down routes/DNS and terminate `pppd` gracefully before the process exits.
 - **Orphaned `pppd` cleanup (Unix)** — the PID of the launched `pppd` is tracked in `/var/run/openfortivpn-go.pppd.pid`. If a previous run was killed non-gracefully (`kill -9`, crash, abrupt system sleep) and left `pppd` running, the next run detects and terminates it before starting a new session — avoiding two PPP sessions competing for the same OS-level PPP link.
 - **macOS: prevents idle sleep while connected** — shells out to `caffeinate -s -w <pid>` for the lifetime of the tunnel, so the Mac won't go to sleep with the PPP link (and the legacy `com.apple.nke.ppp` kernel extension it depends on) active. The assertion is tied to the process PID, so it's automatically released even if the process dies unexpectedly.
+- **Diagnosing macOS `com.apple.nke.ppp` kernel panics** — this legacy kext can, rarely, panic the whole system (`panic (by design)`, with `com.apple.nke.ppp` in the panic log's "Kernel Extensions in backtrace"). If this happens during otherwise-normal use (not at connect/disconnect time), it's most likely a latent bug in Apple's own kext rather than in this client — but to build evidence for a bug report, reproduce with `-vvv --pppd-log /path/to/pppd.log` running, which pairs with a low-volume `tunnel heartbeat` debug log emitted every 60s so the panic report's `Epoch Calendar` timestamp can be matched against the client's and `pppd`'s own logs from just before the crash. `--pppd-extra-arg` lets you test alternate `pppd` options (e.g. a different `mru`, or explicit `lcp-echo-interval`/`lcp-echo-failure`) without a rebuild, in case a specific negotiated option is the trigger — each flag adds one raw argv token, so an option and its value need two occurrences (`--pppd-extra-arg mru --pppd-extra-arg 1500`).
 - **Configuration file** — every CLI flag has an equivalent config-file key, using the same INI-style format and default path (`/etc/openfortivpn/config`) as the original client. See [Configuration file](#configuration-file).
 - **Flexible logging**:
   - `-v` / `-vv` / `-vvv` — progressively more verbose console output.
@@ -173,6 +174,7 @@ sudo openfortivpn vpn.example.com -u alice --persistent 10
 | `--pppd-ifname <name>` | | `pppd` interface name |
 | `--pppd-call <path>` | | `pppd` call file |
 | `--pppd-accept-remote` | | Accept the remote IP address offered by `pppd` |
+| `--pppd-extra-arg <arg>` | | Extra raw argv token passed to `pppd` verbatim (repeatable; an option and its value each need their own `--pppd-extra-arg`, e.g. `--pppd-extra-arg mru --pppd-extra-arg 1500` — for diagnostics, without a rebuild) |
 | `--persistent <seconds>` | | Reconnect automatically after this many seconds (`0` = disabled) |
 | `--log-file <path>` | | Write full DEBUG-level logs to this file regardless of `-v` |
 | `--version` | | Print the client version |
@@ -210,6 +212,9 @@ pppd-ipparam =
 pppd-ifname =
 pppd-call =
 pppd-accept-remote = false
+# pppd-extra-arg = mru        (repeatable; one raw argv token per line —
+# pppd-extra-arg = 1500        an option and its value need two entries, since
+#                               each becomes a separate pppd argv element)
 
 ca-file =
 user-cert =

@@ -147,6 +147,8 @@ func applyKey(cfg *Config, key, val, filename string, line int) error {
 			return loc("invalid pppd-accept-remote")
 		}
 		cfg.PPPDAcceptRemote = b
+	case "pppd-extra-arg":
+		cfg.PPPDExtraArgs = append(cfg.PPPDExtraArgs, val)
 	case "ppp-system":
 		cfg.PPPSystem = val
 	case "ca-file":

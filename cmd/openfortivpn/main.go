@@ -55,15 +55,16 @@ func rootCmd() *cobra.Command {
 		trustedCert []string
 		persistent  uint
 
-		noRoutes        bool
-		noDNS           bool
-		halfInternet    bool
-		pppdUsePeerDNS  bool
-		pppdLog         string
-		pppdPlugin      string
-		pppdIfname      string
-		pppdCall        string
+		noRoutes         bool
+		noDNS            bool
+		halfInternet     bool
+		pppdUsePeerDNS   bool
+		pppdLog          string
+		pppdPlugin       string
+		pppdIfname       string
+		pppdCall         string
 		pppdAcceptRemote bool
+		pppdExtraArgs    []string
 	)
 
 	cmd := &cobra.Command{
@@ -183,6 +184,9 @@ func rootCmd() *cobra.Command {
 			if cmd.Flags().Changed("pppd-accept-remote") {
 				cfg.PPPDAcceptRemote = pppdAcceptRemote
 			}
+			if len(pppdExtraArgs) > 0 {
+				cfg.PPPDExtraArgs = append(cfg.PPPDExtraArgs, pppdExtraArgs...)
+			}
 			if cmd.Flags().Changed("persistent") {
 				cfg.Persistent = 0
 				if persistent > 0 {
@@ -242,6 +246,7 @@ func rootCmd() *cobra.Command {
 	f.StringVar(&pppdIfname, "pppd-ifname", "", "pppd interface name")
 	f.StringVar(&pppdCall, "pppd-call", "", "pppd call file")
 	f.BoolVar(&pppdAcceptRemote, "pppd-accept-remote", false, "Accept remote IP from pppd")
+	f.StringArrayVar(&pppdExtraArgs, "pppd-extra-arg", nil, "Extra raw argv token for pppd (repeatable; option and value each need their own occurrence, e.g. --pppd-extra-arg mru --pppd-extra-arg 1500)")
 	f.UintVar(&persistent, "persistent", 0, "Reconnect interval in seconds (0 = no reconnect)")
 	f.StringVar(&logFile, "log-file", "", "Write all logs (DEBUG level) to this file, regardless of -v")
 

@@ -52,6 +52,7 @@ type Config struct {
 	PPPDIfname       string
 	PPPDCall         string
 	PPPDAcceptRemote bool
+	PPPDExtraArgs    []string // passed through to pppd verbatim, after all other args
 
 	// FreeBSD ppp (legacy)
 	PPPSystem string

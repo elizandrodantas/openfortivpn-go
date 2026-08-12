@@ -35,6 +35,21 @@ const (
 	StateDisconnecting
 )
 
+func (s TunnelState) String() string {
+	switch s {
+	case StateDown:
+		return "down"
+	case StateConnecting:
+		return "connecting"
+	case StateUp:
+		return "up"
+	case StateDisconnecting:
+		return "disconnecting"
+	default:
+		return "unknown"
+	}
+}
+
 // Tunnel manages a single VPN session.
 type Tunnel struct {
 	cfg    *config.Config
@@ -211,6 +226,15 @@ func (t *Tunnel) connect(ctx context.Context) error {
 		OnCancel: proc.Close, // kills pppd → PTY EOF → unblocks ptyReader on Ctrl+C
 	}
 
+	// Low-volume heartbeat so that, if the kernel panics inside
+	// com.apple.nke.ppp during otherwise-normal operation, the panic log's
+	// own Epoch Calendar timestamp can be correlated against our last known
+	// state — there is no other signal on our side when that happens, since
+	// nothing in this program's own connect/reconnect/shutdown paths runs.
+	statusCtx, statusCancel := context.WithCancel(ctx)
+	defer statusCancel()
+	go t.logPeriodicStatus(statusCtx)
+
 	// Fallback: poll for the PPP interface using the XML-assigned IP in case
 	// IPCP packet detection misses the event (e.g. FF 03 prefix variance,
 	// or the ACK arrives before the relay loop starts inspecting).
@@ -255,6 +279,24 @@ func (t *Tunnel) connect(ctx context.Context) error {
 	t.teardownNetwork()
 	t.setState(StateDown)
 	return runErr
+}
+
+// logPeriodicStatus emits a low-volume heartbeat while the tunnel is active,
+// giving a timestamped trail of the tunnel's last known state to compare
+// against a kernel panic log if one occurs during normal, steady-state use.
+func (t *Tunnel) logPeriodicStatus(ctx context.Context) {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			slog.Debug("tunnel heartbeat",
+				"state", TunnelState(t.state.Load()),
+				"assigned_ip", t.ipv4Cfg.AssignedIP)
+		}
+	}
 }
 
 // requestVPNAllocation performs the HTTP steps needed to reserve a VPN session.
