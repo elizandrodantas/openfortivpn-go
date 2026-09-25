@@ -156,6 +156,7 @@ sudo openfortivpn vpn.example.com -u alice --persistent 10
 | `--sni <hostname>` | | Override the TLS SNI hostname sent to the gateway |
 | `--ifname <name>` | | Bind to a specific local network interface |
 | `--pinentry <path>` | | Path to a `pinentry` binary for secure password entry |
+| `--force-login` | | When the gateway only allows one session per user (`limit-user-logins`), disconnect the other open session without asking |
 | `--ca-file <path>` | | Custom CA certificate bundle |
 | `--user-cert <path>` | | Client certificate (PEM path, or `pkcs11:...` URI) |
 | `--user-key <path>` | | Client private key file |
@@ -193,6 +194,7 @@ password = hunter2
 otp-prompt = Enter your FortiToken code:
 otp-delay = 5
 no-ftm-push = false
+force-login = false
 
 realm = corp
 sni = vpn.example.com

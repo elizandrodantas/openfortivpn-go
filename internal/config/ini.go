@@ -85,6 +85,12 @@ func applyKey(cfg *Config, key, val, filename string, line int) error {
 		cfg.NoFTMPush = b
 	case "pinentry":
 		cfg.Pinentry = val
+	case "force-login":
+		b, err := parseBool(val)
+		if err != nil {
+			return loc("invalid force-login")
+		}
+		cfg.ForceLogin = b
 	case "realm":
 		cfg.Realm = val
 	case "sni":

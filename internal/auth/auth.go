@@ -15,6 +15,7 @@ var (
 	ErrNoCookie      = errors.New("auth: no SVPNCOOKIE in response")
 	ErrNeedOTP       = errors.New("auth: one-time password required")
 	ErrNeedFTMPush   = errors.New("auth: FTM push required")
+	ErrAlreadyLoggedIn = errors.New("auth: another SSL VPN session is open for this user and was kept")
 )
 
 // Authenticator authenticates to the VPN gateway and returns the SVPNCOOKIE.

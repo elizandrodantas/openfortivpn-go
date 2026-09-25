@@ -44,6 +44,7 @@ func rootCmd() *cobra.Command {
 		sni         string
 		ifname      string
 		pinentry    string
+		forceLogin  bool
 		caFile      string
 		userCert    string
 		userKey     string
@@ -141,6 +142,9 @@ func rootCmd() *cobra.Command {
 			applyStringFlag(cmd, "sni", sni, &cfg.SNI)
 			applyStringFlag(cmd, "ifname", ifname, &cfg.IfaceName)
 			applyStringFlag(cmd, "pinentry", pinentry, &cfg.Pinentry)
+			if cmd.Flags().Changed("force-login") {
+				cfg.ForceLogin = forceLogin
+			}
 			applyStringFlag(cmd, "ca-file", caFile, &cfg.CAFile)
 			applyStringFlag(cmd, "user-cert", userCert, &cfg.UserCert)
 			applyStringFlag(cmd, "user-key", userKey, &cfg.UserKey)
@@ -228,6 +232,7 @@ func rootCmd() *cobra.Command {
 	f.StringVar(&sni, "sni", "", "TLS SNI hostname override")
 	f.StringVar(&ifname, "ifname", "", "Bind to network interface")
 	f.StringVar(&pinentry, "pinentry", "", "Path to pinentry binary for secure password input")
+	f.BoolVar(&forceLogin, "force-login", false, "Disconnect your other open SSL VPN session without asking (gateways with 'limit-user-logins')")
 	f.StringVar(&caFile, "ca-file", "", "CA certificate file")
 	f.StringVar(&userCert, "user-cert", "", "Client certificate file (PEM or pkcs11: URI)")
 	f.StringVar(&userKey, "user-key", "", "Client private key file")

@@ -28,6 +28,10 @@ type Config struct {
 	OTPDelay      time.Duration
 	NoFTMPush     bool
 	Pinentry      string
+	// ForceLogin answers "yes" when the gateway ('limit-user-logins') asks
+	// whether to disconnect the user's other open session, instead of
+	// prompting.
+	ForceLogin bool
 
 	// Network identity
 	IfaceName string

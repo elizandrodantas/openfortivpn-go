@@ -33,6 +33,7 @@ func (a *PasswordAuth) Authenticate(ctx context.Context, c *httptunnel.Client, c
 		"credential": {pass},
 		"ajax":       {"1"},
 	}
+	setJustLoggedIn(values)
 	if cfg.Realm != "" {
 		values.Set("realm", cfg.Realm)
 	}
@@ -50,7 +51,7 @@ func (a *PasswordAuth) Authenticate(ctx context.Context, c *httptunnel.Client, c
 	}
 
 	if resp.StatusCode == 200 && strings.Contains(body, "ret=1") {
-		return a.cookieOrRedir(c, body)
+		return a.cookieOrRedir(c, cfg, body)
 	}
 
 	// 401 or compact challenge with tokeninfo — 2FA required
@@ -86,6 +87,7 @@ func (a *PasswordAuth) handle2FA(ctx context.Context, c *httptunnel.Client, cfg 
 			"peer":     {peer},
 			"ftmpush":  {"1"},
 		}
+		setJustLoggedIn(values)
 		if magic != "" {
 			values.Set("magic", magic)
 		}
@@ -104,7 +106,7 @@ func (a *PasswordAuth) handle2FA(ctx context.Context, c *httptunnel.Client, cfg 
 			return "", fmt.Errorf("auth: FTM push: %w", err)
 		}
 		if resp.StatusCode == 200 {
-			return a.cookieOrRedir(c, string(resp.Body))
+			return a.cookieOrRedir(c, cfg, string(resp.Body))
 		}
 	}
 
@@ -140,6 +142,7 @@ func (a *PasswordAuth) handle2FA(ctx context.Context, c *httptunnel.Client, cfg 
 		"code2":    {""},
 		"magic":    {magic},
 	}
+	setJustLoggedIn(values)
 
 	resp, err := c.PostForm("/remote/logincheck", values)
 	if err != nil {
@@ -147,18 +150,38 @@ func (a *PasswordAuth) handle2FA(ctx context.Context, c *httptunnel.Client, cfg 
 	}
 
 	if resp.StatusCode == 200 {
-		return a.cookieOrRedir(c, string(resp.Body))
+		return a.cookieOrRedir(c, cfg, string(resp.Body))
 	}
 	return "", fmt.Errorf("%w: OTP rejected (status=%d body=%s)", ErrAuthFailed, resp.StatusCode, string(resp.Body))
+}
+
+// setJustLoggedIn adds the fields FortiClient appends to every logincheck
+// POST. Without just_logged_in=1, a gateway with 'limit-user-logins' denies
+// the login outright (sslvpn_login_permission_denied) when the user already
+// has an open session, instead of offering to disconnect it.
+func setJustLoggedIn(values url.Values) {
+	values.Set("redir", "/remote/index")
+	values.Set("just_logged_in", "1")
 }
 
 // cookieOrRedir returns the current cookie if already set on c. If the body
 // contains a redir= field (compact format from ajax=1 responses), or an
 // HTML action= URL (full-page responses), it follows that URL to retrieve
-// the SVPNCOOKIE from the redirect target's Set-Cookie header.
-func (a *PasswordAuth) cookieOrRedir(c *httptunnel.Client, body string) (string, error) {
+// the SVPNCOOKIE from the redirect target's Set-Cookie header. Either
+// response may carry the "already logged in" prompt, which is handled via
+// ConfirmLimitUser.
+func (a *PasswordAuth) cookieOrRedir(c *httptunnel.Client, cfg *config.Config, body string) (string, error) {
+	if _, err := ConfirmLimitUser(c, cfg, []byte(body)); err != nil {
+		return "", err
+	}
+	if err := followLoginConfirm(c, cfg, []byte(body)); err != nil {
+		return "", err
+	}
 	if cookie := c.Cookie(); cookie != "" {
 		return cookie, nil
+	}
+	if strings.Contains(body, "permission_denied") {
+		return "", ErrPermission
 	}
 
 	// Try compact FortiGate body format first (redir=URL)
@@ -174,9 +197,12 @@ func (a *PasswordAuth) cookieOrRedir(c *httptunnel.Client, body string) (string,
 	}
 
 	slog.Debug("auth: following redir for cookie", "url", redir)
-	_, err := c.Get(redir)
+	resp, err := c.Get(redir)
 	if err != nil {
 		return "", fmt.Errorf("auth: redir GET %s: %w", redir, err)
+	}
+	if _, err := ConfirmLimitUser(c, cfg, resp.Body); err != nil {
+		return "", err
 	}
 
 	if cookie := c.Cookie(); cookie != "" {

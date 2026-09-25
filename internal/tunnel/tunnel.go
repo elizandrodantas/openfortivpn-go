@@ -148,6 +148,8 @@ func (t *Tunnel) connect(ctx context.Context) error {
 	if err := t.requestVPNAllocation(ctx, httpCli); err != nil {
 		return fmt.Errorf("VPN allocation: %w", err)
 	}
+	// Confirming the "already logged in" prompt may have issued a new cookie.
+	cookie = httpCli.Cookie()
 
 	// Step 4: Fresh TLS connection for tunnel phase
 	conn.Close()
@@ -166,6 +168,7 @@ func (t *Tunnel) connect(ctx context.Context) error {
 	if err := t.fetchConfig(ctx, httpCli); err != nil {
 		return fmt.Errorf("config fetch: %w", err)
 	}
+	cookie = httpCli.Cookie()
 
 	// Step 6: Launch pppd
 	slog.Info("Launching PPP daemon")
@@ -301,15 +304,15 @@ func (t *Tunnel) logPeriodicStatus(ctx context.Context) {
 
 // requestVPNAllocation performs the HTTP steps needed to reserve a VPN session.
 func (t *Tunnel) requestVPNAllocation(_ context.Context, c *httptunnel.Client) error {
-	resp, err := c.Get("/remote/index")
+	resp, err := t.getConfirmingLimitUser(c, "/remote/index")
 	if err != nil {
-		return fmt.Errorf("GET /remote/index: %w", err)
+		return err
 	}
 	slog.Debug("VPN index", "status", resp.StatusCode)
 
-	resp, err = c.Get("/remote/fortisslvpn")
+	resp, err = t.getConfirmingLimitUser(c, "/remote/fortisslvpn")
 	if err != nil {
-		return fmt.Errorf("GET /remote/fortisslvpn: %w", err)
+		return err
 	}
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("VPN allocation returned %d", resp.StatusCode)
@@ -317,11 +320,33 @@ func (t *Tunnel) requestVPNAllocation(_ context.Context, c *httptunnel.Client) e
 	return nil
 }
 
+// getConfirmingLimitUser GETs path and, if the gateway answers with the
+// "already logged in" prompt ('limit-user-logins'), handles it and repeats
+// the request once.
+func (t *Tunnel) getConfirmingLimitUser(c *httptunnel.Client, path string) (*httptunnel.Response, error) {
+	resp, err := c.Get(path)
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", path, err)
+	}
+	handled, err := auth.ConfirmLimitUser(c, t.cfg, resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if !handled {
+		return resp, nil
+	}
+	resp, err = c.Get(path)
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", path, err)
+	}
+	return resp, nil
+}
+
 // fetchConfig retrieves the XML VPN configuration from the gateway.
 func (t *Tunnel) fetchConfig(_ context.Context, c *httptunnel.Client) error {
-	resp, err := c.Get("/remote/fortisslvpn_xml")
+	resp, err := t.getConfirmingLimitUser(c, "/remote/fortisslvpn_xml")
 	if err != nil {
-		return fmt.Errorf("GET /remote/fortisslvpn_xml: %w", err)
+		return err
 	}
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("config fetch returned %d", resp.StatusCode)

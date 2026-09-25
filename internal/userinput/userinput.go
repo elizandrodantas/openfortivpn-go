@@ -35,6 +35,20 @@ func ReadLine(prompt string) (string, error) {
 	return "", fmt.Errorf("userinput: EOF reading line")
 }
 
+// Confirm asks a yes/no question on stdin. Only "y"/"yes" (any case) count
+// as yes; anything else, including an empty line, is no.
+func Confirm(prompt string) (bool, error) {
+	answer, err := ReadLine(prompt)
+	if err != nil {
+		return false, err
+	}
+	switch strings.ToLower(answer) {
+	case "y", "yes":
+		return true, nil
+	}
+	return false, nil
+}
+
 func readFromTerminal(prompt string) (string, error) {
 	fmt.Print(prompt)
 	b, err := term.ReadPassword(int(os.Stdin.Fd()))
