@@ -17,8 +17,8 @@ const resolverDir = "/etc/resolver"
 
 // darwinDNS implements DNSManager on macOS.
 //
-// Primary path: Apple's own /usr/sbin/pppd publishes DNS natively into the
-// SCDynamicStore via "usepeerdns"+"serviceid" (wired in
+// With --use-pppd: Apple's own /usr/sbin/pppd publishes DNS natively into
+// the SCDynamicStore via "usepeerdns"+"serviceid" (wired in
 // internal/ppp/pppd_unix.go) whenever the FortiGate sends DNS options during
 // IPCP negotiation. That binary is Apple-signed and has built-in
 // SystemConfiguration integration (confirmed via strings: ConfirmedServiceID,
@@ -26,36 +26,48 @@ const resolverDir = "/etc/resolver"
 // observed on a live, working official-FortiClient session. Add() is a no-op
 // whenever this already happened (ipcpProvidedDNS == true).
 //
-// Fallback path: if the peer didn't provide DNS via IPCP (some FortiGate
-// configs only advertise DNS in the XML config, not IPCP), pppd's native
-// mechanism has nothing to publish, so we fall back to /etc/resolver/<domain>
+// Full tunnel (internet routed through the VPN interface, the default utun
+// backend): publish State:/Network/Service/<id>/{IPv4,DNS} ourselves, the
+// way openconnect's vpnc-script does on macOS. The IPv4 entry carries
+// InterfaceName + OverridePrimary, which is what makes configd promote the
+// service's DNS to the unscoped default resolver instead of a per-interface
+// scoped one (an earlier hand-rolled registration without OverridePrimary
+// only ever got the scoped tier).
+//
+// Split tunnel, or if the publication above fails: /etc/resolver/<domain>
 // files, discovering the domain via PTR lookup when the XML didn't supply
 // one. This mechanism is NOT interface-bound: the kernel routes queries to
 // the nameserver via the normal routing table, so the VPN DNS server is
 // reached via the VPN interface using the VPN-assigned IP as source.
-//
-// A true global-default-resolver override (what the official FortiClient
-// achieves via its own tunnel) was also attempted here via a hand-rolled
-// State:/Network/Service/<id>/{DNS,IPv4,VPN} SCDynamicStore registration, but
-// live testing showed macOS only promotes it to a per-interface SCOPED
-// resolver, not the unscoped default — that tier appears reserved for
-// privileged NetworkExtension providers and isn't reachable from a plain,
-// unsigned CLI binary.
 type darwinDNS struct {
 	resolverFiles []string // files we created; removed on disconnect
+	scKeys        []string // SCDynamicStore keys we published; removed on disconnect
 }
+
+// scServiceID is the SCDynamicStore service id used for our own DNS
+// publication (distinct from the "openfortivpn" serviceid handed to pppd).
+const scServiceID = "openfortivpn-go"
 
 // NewDNSManager returns a macOS DNS manager.
 func NewDNSManager(_ bool) DNSManager {
 	return &darwinDNS{}
 }
 
-func (d *darwinDNS) Add(_ string, _, ns1, ns2 net.IP, suffix string, ipcpProvidedDNS bool) error {
+func (d *darwinDNS) Add(iface string, assignedIP, ns1, ns2 net.IP, suffix string, ipcpProvidedDNS bool) error {
 	if ipcpProvidedDNS {
 		// pppd's own usepeerdns+serviceid already published this natively.
 		return nil
 	}
-	slog.Info("VPN peer did not provide DNS via IPCP — falling back to /etc/resolver")
+
+	if routesInternetVia(iface) {
+		err := d.publishService(iface, assignedIP, ns1, ns2, suffix)
+		if err == nil {
+			slog.Debug("published VPN DNS as primary resolver", "service", scServiceID, "iface", iface)
+			flushDNSCache()
+			return nil
+		}
+		slog.Warn("could not publish VPN DNS via SCDynamicStore — falling back to /etc/resolver", "err", err)
+	}
 
 	// Discover the domain if the VPN server didn't provide one.
 	// PTR lookup of each nameserver via itself: e.g.
@@ -99,8 +111,88 @@ func (d *darwinDNS) Add(_ string, _, ns1, ns2 net.IP, suffix string, ipcpProvide
 	return nil
 }
 
+// publishService registers the VPN as a primary network service carrying
+// its DNS servers, via scutil.
+func (d *darwinDNS) publishService(iface string, assignedIP, ns1, ns2 net.IP, suffix string) error {
+	var servers []string
+	for _, ns := range []net.IP{ns1, ns2} {
+		if ns != nil {
+			servers = append(servers, ns.String())
+		}
+	}
+	if len(servers) == 0 || assignedIP == nil {
+		return fmt.Errorf("no nameservers or assigned IP to publish")
+	}
+
+	ipv4Key := "State:/Network/Service/" + scServiceID + "/IPv4"
+	dnsKey := "State:/Network/Service/" + scServiceID + "/DNS"
+
+	var sb strings.Builder
+	sb.WriteString("d.init\n")
+	fmt.Fprintf(&sb, "d.add Addresses * %s\n", assignedIP)
+	sb.WriteString("d.add SubnetMasks * 255.255.255.255\n")
+	fmt.Fprintf(&sb, "d.add Router %s\n", assignedIP)
+	fmt.Fprintf(&sb, "d.add InterfaceName %s\n", iface)
+	sb.WriteString("d.add OverridePrimary # 1\n")
+	fmt.Fprintf(&sb, "set %s\n", ipv4Key)
+	sb.WriteString("d.init\n")
+	fmt.Fprintf(&sb, "d.add ServerAddresses * %s\n", strings.Join(servers, " "))
+	if suffix != "" {
+		fmt.Fprintf(&sb, "d.add DomainName %s\n", suffix)
+		fmt.Fprintf(&sb, "d.add SearchDomains * %s\n", suffix)
+	}
+	fmt.Fprintf(&sb, "set %s\n", dnsKey)
+	sb.WriteString("quit\n")
+
+	// Record the keys before running, so a partial failure is still
+	// cleaned up by Remove.
+	d.scKeys = append(d.scKeys, ipv4Key, dnsKey)
+	return runScutil(sb.String())
+}
+
+func runScutil(script string) error {
+	cmd := exec.Command("scutil")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("scutil: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// routesInternetVia reports whether internet traffic is routed through
+// iface, i.e. this is a full tunnel (default route or the two /1 routes
+// from --half-internet-routes), as opposed to split tunneling.
+func routesInternetVia(iface string) bool {
+	if iface == "" {
+		return false
+	}
+	out, err := exec.Command("route", "-n", "get", "1.1.1.1").Output()
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if ok && k == "interface" {
+			return strings.TrimSpace(v) == iface
+		}
+	}
+	return false
+}
+
 func (d *darwinDNS) Remove(_, _ net.IP, _ string) error {
 	var errs []string
+	if len(d.scKeys) > 0 {
+		var sb strings.Builder
+		for _, k := range d.scKeys {
+			fmt.Fprintf(&sb, "remove %s\n", k)
+		}
+		sb.WriteString("quit\n")
+		if err := runScutil(sb.String()); err != nil {
+			errs = append(errs, err.Error())
+		}
+		d.scKeys = nil
+	}
 	for _, path := range d.resolverFiles {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			errs = append(errs, fmt.Sprintf("remove %s: %v", path, err))

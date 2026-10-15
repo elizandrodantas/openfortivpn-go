@@ -5,6 +5,7 @@ package ppp
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -30,8 +31,8 @@ const pidFilePath = "/var/run/openfortivpn-go.pppd.pid"
 // the PID.
 var pppdSignature = []string{"230400", ":169.254.2.1", "lcp-max-configure"}
 
-// Process wraps a running pppd subprocess and its PTY master.
-type Process struct {
+// pppdProcess wraps a running pppd subprocess and its PTY master.
+type pppdProcess struct {
 	cmd       *exec.Cmd
 	master    *os.File
 	closeOnce sync.Once
@@ -46,13 +47,13 @@ type Process struct {
 }
 
 // PTY returns the PTY master file, used by the I/O relay goroutines.
-func (p *Process) PTY() *os.File {
+func (p *pppdProcess) PTY() io.ReadWriter {
 	return p.master
 }
 
-// Start launches pppd with the appropriate arguments derived from cfg.
+// startPPPD launches pppd with the appropriate arguments derived from cfg.
 // It uses a PTY (pseudo-terminal) to communicate with pppd.
-func Start(cfg *config.Config) (*Process, error) {
+func startPPPD(cfg *config.Config) (Process, error) {
 	if err := cleanupOrphan(); err != nil {
 		slog.Warn("orphaned pppd cleanup failed", "err", err)
 	}
@@ -75,7 +76,7 @@ func Start(cfg *config.Config) (*Process, error) {
 		slog.Warn("could not write pppd pid file", "path", pidFilePath, "err", err)
 	}
 
-	p := &Process{cmd: cmd, master: master, waitDone: make(chan struct{})}
+	p := &pppdProcess{cmd: cmd, master: master, waitDone: make(chan struct{})}
 	go func() {
 		p.waitErr = cmd.Wait()
 		close(p.waitDone)
@@ -84,7 +85,7 @@ func Start(cfg *config.Config) (*Process, error) {
 }
 
 // Wait waits for pppd to exit, respecting context cancellation.
-func (p *Process) Wait(ctx context.Context) error {
+func (p *pppdProcess) Wait(ctx context.Context) error {
 	select {
 	case <-p.waitDone:
 		return interpretExitError(p.waitErr)
@@ -111,7 +112,7 @@ func (p *Process) Wait(ctx context.Context) error {
 // double-teardown that can wedge or crash the legacy com.apple.nke.ppp kext
 // on macOS, so we let pppd finish exiting on its own (escalating to SIGKILL
 // only if it doesn't) before severing the tty.
-func (p *Process) Close() {
+func (p *pppdProcess) Close() {
 	p.closeOnce.Do(func() {
 		if p.cmd.Process != nil {
 			p.cmd.Process.Signal(syscall.SIGTERM) //nolint:errcheck

@@ -56,7 +56,7 @@ DNS handling is implemented per-platform to match each OS's native mechanisms as
 
 - **Linux** — updates `/etc/resolv.conf` directly (with automatic backup/restore of the original file), or delegates to `resolvconf` if available (`--pppd-use-peerdns` / `use-resolvconf` in the config file).
 - **Windows** — configures DNS servers on the PPP interface via `netsh interface ip set/add dns`, restoring DHCP-sourced DNS on disconnect.
-- **macOS** — primarily relies on Apple's own signed `pppd` binary to publish DNS natively into `SCDynamicStore` (via `usepeerdns` + a registered `serviceid`), matching how the official FortiClient integrates with the system. If the gateway doesn't hand out DNS during IPCP negotiation, the client falls back to writing scoped resolver files under `/etc/resolver/<domain>` — and if no DNS search domain was provided by the gateway, it **automatically discovers one via a reverse-DNS (PTR) lookup** of the assigned DNS servers. The DNS cache is flushed (`dscacheutil` + `mDNSResponder`) after any change.
+- **macOS** — on a full tunnel, publishes the VPN as the primary network service in `SCDynamicStore` (`State:/Network/Service/openfortivpn-go/{IPv4,DNS}` with `OverridePrimary`, the same approach openconnect's `vpnc-script` uses), so the VPN DNS servers become the default resolver. On a split tunnel (or if that publication fails) it writes scoped resolver files under `/etc/resolver/<domain>` — and if no DNS search domain was provided by the gateway, it **automatically discovers one via a reverse-DNS (PTR) lookup** of the assigned DNS servers. With `--use-pppd`, Apple's own signed `pppd` publishes DNS natively instead (via `usepeerdns` + a registered `serviceid`) whenever the gateway hands out DNS during IPCP. The DNS cache is flushed (`dscacheutil` + `mDNSResponder`) after any change.
 - **`--no-dns`** — disable all DNS configuration changes.
 
 ### Reliability & operations
@@ -64,8 +64,7 @@ DNS handling is implemented per-platform to match each OS's native mechanisms as
 - **Persistent reconnection** — `--persistent <seconds>` automatically reconnects after a disconnect instead of exiting, with a configurable delay between attempts.
 - **Clean shutdown** — `Ctrl+C` (SIGINT), SIGTERM, or SIGHUP (e.g. closing the terminal window the process is attached to) tear down routes/DNS and terminate `pppd` gracefully before the process exits.
 - **Orphaned `pppd` cleanup (Unix)** — the PID of the launched `pppd` is tracked in `/var/run/openfortivpn-go.pppd.pid`. If a previous run was killed non-gracefully (`kill -9`, crash, abrupt system sleep) and left `pppd` running, the next run detects and terminates it before starting a new session — avoiding two PPP sessions competing for the same OS-level PPP link.
-- **macOS: prevents idle sleep while connected** — shells out to `caffeinate -s -w <pid>` for the lifetime of the tunnel, so the Mac won't go to sleep with the PPP link (and the legacy `com.apple.nke.ppp` kernel extension it depends on) active. The assertion is tied to the process PID, so it's automatically released even if the process dies unexpectedly.
-- **Diagnosing macOS `com.apple.nke.ppp` kernel panics** — this legacy kext can, rarely, panic the whole system (`panic (by design)`, with `com.apple.nke.ppp` in the panic log's "Kernel Extensions in backtrace"). If this happens during otherwise-normal use (not at connect/disconnect time), it's most likely a latent bug in Apple's own kext rather than in this client — but to build evidence for a bug report, reproduce with `-vvv --pppd-log /path/to/pppd.log` running, which pairs with a low-volume `tunnel heartbeat` debug log emitted every 60s so the panic report's `Epoch Calendar` timestamp can be matched against the client's and `pppd`'s own logs from just before the crash. `--pppd-extra-arg` lets you test alternate `pppd` options (e.g. a different `mru`, or explicit `lcp-echo-interval`/`lcp-echo-failure`) without a rebuild, in case a specific negotiated option is the trigger — each flag adds one raw argv token, so an option and its value need two occurrences (`--pppd-extra-arg mru --pppd-extra-arg 1500`).
+- **macOS: no `pppd`, no PPP kernel extension** — by default the client negotiates PPP itself (the same LCP/IPCP engine used on Windows, `internal/ppp/pppproto`) and carries IPv4 over a native `utun` interface. Apple's `pppd` drives the legacy `com.apple.nke.ppp` kext, which has been observed to panic the kernel from inside its own packet handling (`Break 0x5519 ... Panic (by design)`, a bounds-check trap, with `com.apple.nke.ppp` in "Kernel Extensions in backtrace") during otherwise-normal use; the utun backend keeps that kext out of the data path entirely. `--use-pppd` / `use-pppd = true` restores the old `pppd`-over-PTY behavior, including a `caffeinate -s -w <pid>` idle-sleep assertion for the lifetime of the tunnel, `--pppd-log`, and `--pppd-extra-arg` to pass raw argv tokens to `pppd` (an option and its value each need their own occurrence, e.g. `--pppd-extra-arg mru --pppd-extra-arg 1500`).
 - **Configuration file** — every CLI flag has an equivalent config-file key, using the same INI-style format and default path (`/etc/openfortivpn/config`) as the original client. See [Configuration file](#configuration-file).
 - **Flexible logging**:
   - `-v` / `-vv` / `-vvv` — progressively more verbose console output.
@@ -84,9 +83,9 @@ Single static binaries for:
 
 ## Requirements
 
-- A system `pppd` binary on **Linux** and **macOS** (openfortivpn-go shells out to it, matching the original client's architecture) — e.g. `apt install ppp` / `dnf install ppp` on Linux; macOS ships `pppd` out of the box.
+- A system `pppd` binary on **Linux** (openfortivpn-go shells out to it, matching the original client's architecture) — e.g. `apt install ppp` / `dnf install ppp`. **macOS** needs nothing extra: it uses a built-in PPP engine over `utun` by default (and the system `pppd`, shipped with macOS, only with `--use-pppd`).
 - **Windows** needs no separate driver install: if `wintun.dll` (the [`wintun`](https://www.wintun.net/) driver — the same one WireGuard/Tailscale use) isn't already present next to the executable or in `System32`, it's downloaded automatically on first run for the correct architecture, with its checksum verified before use. Requires internet access on first run; place a trusted copy of `wintun.dll` next to the executable yourself to skip the download entirely.
-- **Root/administrator privileges** — required to run `pppd` (or create the TUN adapter on Windows), modify the routing table, and change DNS configuration. Run with `sudo` on Linux/macOS or an elevated shell on Windows.
+- **Root/administrator privileges** — required to run `pppd` (or create the `utun`/`wintun` interface on macOS/Windows), modify the routing table, and change DNS configuration. Run with `sudo` on Linux/macOS or an elevated shell on Windows.
 
 ## Installation
 
@@ -169,6 +168,7 @@ sudo openfortivpn vpn.example.com -u alice --persistent 10
 | `--no-routes` | | Do not modify the routing table |
 | `--no-dns` | | Do not modify DNS configuration |
 | `--half-internet-routes` | | Use `0.0.0.0/1` + `128.0.0.0/1` instead of replacing the default route |
+| `--use-pppd` | | macOS: use the system `pppd` (legacy `com.apple.nke.ppp` kext) instead of the built-in PPP engine over `utun` |
 | `--pppd-use-peerdns` | | Ask `pppd` to configure DNS itself |
 | `--pppd-log <path>` | | `pppd` log file |
 | `--pppd-plugin <path>` | | `pppd` plugin path |
@@ -207,6 +207,7 @@ persistent = 10
 use-syslog = false
 use-resolvconf = false
 
+use-pppd = false
 pppd-use-peerdns = false
 pppd-log = /var/log/pppd.log
 pppd-plugin =
@@ -267,9 +268,9 @@ The version string embedded in binaries (visible via `--version`) is derived fro
 | `internal/httptunnel` | Minimal hand-rolled HTTP client over the raw TLS socket, plus the local SAML callback server |
 | `internal/tunnel` | Top-level orchestration: connect → auth → XML config → pppd → relay → routes/DNS |
 | `internal/xmlparse` | Lenient parser for the gateway's `fortisslvpn_xml` response (assigned IP, DNS, split routes) |
-| `internal/ppp` | Drives the system `pppd` via a PTY (Unix); on Windows, drives a `wintun` adapter instead |
-| `internal/ppp/pppproto` | Minimal PPP LCP/IPCP negotiation (RFC 1661/1332), used by the Windows engine in place of pppd |
-| `internal/hdlc` | HDLC framing/deframing between the relay loop and the local PPP transport (`pppd` PTY on Unix, `wintun` engine pipe on Windows) |
+| `internal/ppp` | Drives the system `pppd` via a PTY (Linux, or macOS with `--use-pppd`); otherwise runs a userspace PPP engine over `utun` (macOS) or `wintun` (Windows) |
+| `internal/ppp/pppproto` | Minimal PPP LCP/IPCP negotiation (RFC 1661/1332), used by the macOS/Windows engine in place of pppd |
+| `internal/hdlc` | HDLC framing/deframing between the relay loop and the local PPP transport (`pppd` PTY, or the userspace engine's pipe on macOS/Windows) |
 | `internal/io` | Packet framing on the wire and the bidirectional relay loop |
 | `internal/ipv4` | Per-OS routing table and DNS management (Linux/macOS/Windows) |
 | `internal/userinput` | Interactive password/OTP prompts, with optional `pinentry` support |
@@ -278,7 +279,8 @@ The version string embedded in binaries (visible via `--version`) is derived fro
 ## Known limitations
 
 - **Windows support is new and needs real-world testing.** Since there's no `pppd` on Windows, `openfortivpn-go` implements its own minimal PPP client (LCP/IPCP negotiation, see `internal/ppp/pppproto`) on top of a [`wintun`](https://www.wintun.net/) virtual adapter. It requires **Administrator privileges**; `wintun.dll` is fetched automatically on first run if not already present (see [Requirements](#requirements)), which needs internet access at that point. If you hit issues, please open one with `-vvv --log-file` output attached.
-- macOS DNS integration writes scoped resolver entries under `/etc/resolver/<domain>` as a fallback; this is not a global default-resolver override the way the official FortiClient (a signed `NetworkExtension`) can achieve. In practice this only matters if the gateway doesn't hand out DNS via IPCP and no search domain is configured (auto-discovery via PTR lookup covers most of these cases).
+- On a macOS split tunnel, DNS uses scoped resolver entries under `/etc/resolver/<domain>`, so only that domain is resolved by the VPN servers. If no search domain is configured and PTR auto-discovery finds none, internal hostnames may not resolve.
+- The macOS `utun` backend is new. `--pppd-ifname` doesn't apply to it, because the kernel picks the `utunN` name. If you hit issues, `--use-pppd` falls back to the previous behavior; please open an issue with `-vvv --log-file` output.
 
 ## Contributing
 

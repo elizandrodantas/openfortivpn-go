@@ -60,7 +60,7 @@ type Tunnel struct {
 	// Connection objects (reset on each connect attempt)
 	tlsConn   interface{ Close() error }
 	httpClient *httptunnel.Client
-	pppdProc  *ppp.Process
+	pppdProc  ppp.Process
 	ipv4Cfg   ipv4.Config
 
 	// Saved default route for restoration on disconnect
@@ -184,13 +184,15 @@ func (t *Tunnel) connect(ctx context.Context) error {
 		}
 	}()
 
-	// On macOS, prevent idle system sleep while the tunnel is up: sleeping
-	// with the PPP link active (and the legacy com.apple.nke.ppp kernel
-	// extension it depends on) still up is one of the ways that link can end
-	// up in an inconsistent state. "-w <pid>" ties the assertion to our own
-	// process, so it disappears on its own even if we die abruptly instead
-	// of leaving the system unable to sleep forever.
-	if runtime.GOOS == "darwin" {
+	// With --use-pppd on macOS, prevent idle system sleep while the tunnel
+	// is up: sleeping with the PPP link active (and the legacy
+	// com.apple.nke.ppp kernel extension it depends on) still up is one of
+	// the ways that link can end up in an inconsistent state. The default
+	// utun backend doesn't involve that kext, so it doesn't need this.
+	// "-w <pid>" ties the assertion to our own process, so it disappears on
+	// its own even if we die abruptly instead of leaving the system unable
+	// to sleep forever.
+	if runtime.GOOS == "darwin" && cfg.UsePPPD {
 		caffeinate := exec.Command("caffeinate", "-s", "-w", strconv.Itoa(os.Getpid()))
 		if err := caffeinate.Start(); err != nil {
 			slog.Debug("could not start caffeinate", "err", err)
@@ -484,14 +486,15 @@ func (t *Tunnel) onIPCPComplete(info vpnio.IPCPInfo) {
 		ns2 = t.ipv4Cfg.NS2
 	}
 
-	// On macOS, Apple's own pppd (see internal/ppp/pppd_unix.go) publishes
-	// DNS natively via "usepeerdns"+"serviceid" whenever the FortiGate sent
-	// DNS options during IPCP negotiation (info.NS1/NS2). ipcpHasDNS tells
-	// darwinDNS.Add whether that already happened, so it only falls back to
-	// its own /etc/resolver-based mechanism when the peer didn't provide
-	// DNS via IPCP (e.g. a different FortiGate config). Other platforms
-	// ignore this flag and always run their existing DNS logic.
-	ipcpHasDNS := info.NS1 != nil || info.NS2 != nil
+	// With --use-pppd on macOS, Apple's own pppd (see
+	// internal/ppp/pppd_unix.go) publishes DNS natively via
+	// "usepeerdns"+"serviceid" whenever the FortiGate sent DNS options
+	// during IPCP negotiation (info.NS1/NS2). ipcpHasDNS tells darwinDNS.Add
+	// whether that already happened, so it only configures DNS itself when
+	// it didn't. The default utun backend has no pppd to do that, so DNS is
+	// always ours to configure there. Other platforms ignore this flag and
+	// always run their existing DNS logic.
+	ipcpHasDNS := (info.NS1 != nil || info.NS2 != nil) && (runtime.GOOS != "darwin" || cfg.UsePPPD)
 
 	if cfg.SetDNS && (ns1 != nil || ns2 != nil) {
 		if err := t.dns.Add(iface, info.AssignedIP, ns1, ns2, t.ipv4Cfg.DNSSuffix, ipcpHasDNS); err != nil {

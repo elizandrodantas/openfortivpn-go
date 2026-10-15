@@ -49,6 +49,12 @@ type Config struct {
 	// Reconnection
 	Persistent time.Duration // 0 = disabled
 
+	// UsePPPD makes macOS use the system pppd (and the legacy
+	// com.apple.nke.ppp kext it drives) instead of the default userspace
+	// PPP engine over utun. Ignored elsewhere: Linux always uses pppd,
+	// Windows never does.
+	UsePPPD bool
+
 	// pppd options (Unix)
 	PPPDLog          string
 	PPPDPlugin       string

@@ -131,6 +131,12 @@ func applyKey(cfg *Config, key, val, filename string, line int) error {
 			return loc("invalid use-resolvconf")
 		}
 		cfg.UseResolvconf = b
+	case "use-pppd":
+		b, err := parseBool(val)
+		if err != nil {
+			return loc("invalid use-pppd")
+		}
+		cfg.UsePPPD = b
 	case "pppd-use-peerdns":
 		b, err := parseBool(val)
 		if err != nil {

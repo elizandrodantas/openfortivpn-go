@@ -59,6 +59,7 @@ func rootCmd() *cobra.Command {
 		noRoutes         bool
 		noDNS            bool
 		halfInternet     bool
+		usePPPD          bool
 		pppdUsePeerDNS   bool
 		pppdLog          string
 		pppdPlugin       string
@@ -178,6 +179,9 @@ func rootCmd() *cobra.Command {
 			if cmd.Flags().Changed("half-internet-routes") {
 				cfg.HalfInternetRoutes = halfInternet
 			}
+			if cmd.Flags().Changed("use-pppd") {
+				cfg.UsePPPD = usePPPD
+			}
 			if cmd.Flags().Changed("pppd-use-peerdns") {
 				cfg.PPPDUsePeerDNS = pppdUsePeerDNS
 			}
@@ -245,6 +249,7 @@ func rootCmd() *cobra.Command {
 	f.BoolVar(&noRoutes, "no-routes", false, "Do not modify routing table")
 	f.BoolVar(&noDNS, "no-dns", false, "Do not modify DNS configuration")
 	f.BoolVar(&halfInternet, "half-internet-routes", false, "Use 0.0.0.0/1 + 128.0.0.0/1 instead of default route")
+	f.BoolVar(&usePPPD, "use-pppd", false, "macOS: use the system pppd (legacy com.apple.nke.ppp kext) instead of the built-in PPP engine over utun")
 	f.BoolVar(&pppdUsePeerDNS, "pppd-use-peerdns", false, "Ask pppd to configure DNS")
 	f.StringVar(&pppdLog, "pppd-log", "", "pppd log file")
 	f.StringVar(&pppdPlugin, "pppd-plugin", "", "pppd plugin path")
