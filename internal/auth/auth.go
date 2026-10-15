@@ -10,12 +10,12 @@ import (
 )
 
 var (
-	ErrAuthFailed    = errors.New("auth: authentication failed")
-	ErrPermission    = errors.New("auth: permission denied by gateway")
-	ErrNoCookie      = errors.New("auth: no SVPNCOOKIE in response")
-	ErrNeedOTP       = errors.New("auth: one-time password required")
-	ErrNeedFTMPush   = errors.New("auth: FTM push required")
-	ErrAlreadyLoggedIn = errors.New("auth: another SSL VPN session is open for this user and was kept")
+	ErrAuthFailed      = errors.New("authentication failed")
+	ErrPermission      = errors.New("authentication: permission denied by the gateway")
+	ErrNoCookie        = errors.New("authentication: gateway did not return a session cookie (SVPNCOOKIE)")
+	ErrNeedOTP         = errors.New("authentication: one-time password required")
+	ErrNeedFTMPush     = errors.New("authentication: FTM push required")
+	ErrAlreadyLoggedIn = errors.New("authentication: another SSL VPN session is open for this user and was kept")
 )
 
 // Authenticator authenticates to the VPN gateway and returns the SVPNCOOKIE.

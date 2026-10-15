@@ -42,7 +42,7 @@ func ConfirmLimitUser(c *httptunnel.Client, cfg *config.Config, body []byte) (ha
 	if !disconnect {
 		disconnect, err = userinput.Confirm(limitUserPrompt)
 		if err != nil {
-			return true, fmt.Errorf("auth: reading answer: %w", err)
+			return true, fmt.Errorf("authentication: reading answer: %w", err)
 		}
 	}
 	if !disconnect {
@@ -56,7 +56,7 @@ func ConfirmLimitUser(c *httptunnel.Client, cfg *config.Config, body []byte) (ha
 	slog.Info("Disconnecting the other SSL VPN session")
 	resp, err := c.Get(limitUserConfirmPath)
 	if err != nil {
-		return true, fmt.Errorf("auth: login confirm: %w", err)
+		return true, fmt.Errorf("authentication: login confirm: %w", err)
 	}
 	if resp.StatusCode >= 400 {
 		return true, fmt.Errorf("%w: login confirm returned status=%d", ErrAuthFailed, resp.StatusCode)
@@ -73,7 +73,7 @@ func followLoginConfirm(c *httptunnel.Client, cfg *config.Config, body []byte) e
 	}
 	resp, err := c.Get(loginConfirmPath)
 	if err != nil {
-		return fmt.Errorf("auth: GET %s: %w", loginConfirmPath, err)
+		return fmt.Errorf("authentication: GET %s: %w", loginConfirmPath, err)
 	}
 	handled, err := ConfirmLimitUser(c, cfg, resp.Body)
 	if err != nil {

@@ -22,7 +22,7 @@ func (a *PasswordAuth) Authenticate(ctx context.Context, c *httptunnel.Client, c
 		var err error
 		pass, err = userinput.ReadPassword(ctx, cfg.Pinentry, "openfortivpn", "Password: ")
 		if err != nil {
-			return "", fmt.Errorf("auth: reading password: %w", err)
+			return "", fmt.Errorf("authentication: reading password: %w", err)
 		}
 	}
 
@@ -40,14 +40,14 @@ func (a *PasswordAuth) Authenticate(ctx context.Context, c *httptunnel.Client, c
 
 	resp, err := c.PostForm("/remote/logincheck", values)
 	if err != nil {
-		return "", fmt.Errorf("auth: logincheck: %w", err)
+		return "", fmt.Errorf("authentication: logincheck: %w", err)
 	}
 
 	body := string(resp.Body)
 	slog.Debug("auth logincheck response", "status", resp.StatusCode)
 
 	if strings.Contains(body, "permission_denied") || resp.StatusCode == 403 {
-		return "", ErrPermission
+		return "", permissionDenied(body)
 	}
 
 	if resp.StatusCode == 200 && strings.Contains(body, "ret=1") {
@@ -59,7 +59,7 @@ func (a *PasswordAuth) Authenticate(ctx context.Context, c *httptunnel.Client, c
 		return a.handle2FA(ctx, c, cfg, body, pass)
 	}
 
-	return "", fmt.Errorf("%w: unexpected response status=%d body=%q", ErrAuthFailed, resp.StatusCode, body)
+	return "", rejected("login", resp.StatusCode, body)
 }
 
 func (a *PasswordAuth) handle2FA(ctx context.Context, c *httptunnel.Client, cfg *config.Config, body, pass string) (string, error) {
@@ -103,7 +103,7 @@ func (a *PasswordAuth) handle2FA(ctx context.Context, c *httptunnel.Client, cfg 
 
 		resp, err := c.PostForm("/remote/logincheck", values)
 		if err != nil {
-			return "", fmt.Errorf("auth: FTM push: %w", err)
+			return "", fmt.Errorf("authentication: FTM push: %w", err)
 		}
 		if resp.StatusCode == 200 {
 			return a.cookieOrRedir(c, cfg, string(resp.Body))
@@ -120,7 +120,7 @@ func (a *PasswordAuth) handle2FA(ctx context.Context, c *httptunnel.Client, cfg 
 		var err error
 		otp, err = userinput.ReadLine(prompt)
 		if err != nil {
-			return "", fmt.Errorf("auth: reading OTP: %w", err)
+			return "", fmt.Errorf("authentication: reading OTP: %w", err)
 		}
 	}
 
@@ -146,13 +146,13 @@ func (a *PasswordAuth) handle2FA(ctx context.Context, c *httptunnel.Client, cfg 
 
 	resp, err := c.PostForm("/remote/logincheck", values)
 	if err != nil {
-		return "", fmt.Errorf("auth: OTP logincheck: %w", err)
+		return "", fmt.Errorf("authentication: OTP logincheck: %w", err)
 	}
 
 	if resp.StatusCode == 200 {
 		return a.cookieOrRedir(c, cfg, string(resp.Body))
 	}
-	return "", fmt.Errorf("%w: OTP rejected (status=%d body=%s)", ErrAuthFailed, resp.StatusCode, string(resp.Body))
+	return "", rejected("one-time password", resp.StatusCode, string(resp.Body))
 }
 
 // setJustLoggedIn adds the fields FortiClient appends to every logincheck
@@ -181,7 +181,7 @@ func (a *PasswordAuth) cookieOrRedir(c *httptunnel.Client, cfg *config.Config, b
 		return cookie, nil
 	}
 	if strings.Contains(body, "permission_denied") {
-		return "", ErrPermission
+		return "", permissionDenied(body)
 	}
 
 	// Try compact FortiGate body format first (redir=URL)
@@ -199,7 +199,7 @@ func (a *PasswordAuth) cookieOrRedir(c *httptunnel.Client, cfg *config.Config, b
 	slog.Debug("auth: following redir for cookie", "url", redir)
 	resp, err := c.Get(redir)
 	if err != nil {
-		return "", fmt.Errorf("auth: redir GET %s: %w", redir, err)
+		return "", fmt.Errorf("authentication: redir GET %s: %w", redir, err)
 	}
 	if _, err := ConfirmLimitUser(c, cfg, resp.Body); err != nil {
 		return "", err

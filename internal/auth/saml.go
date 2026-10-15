@@ -16,7 +16,7 @@ func (a *SAMLAuth) Authenticate(ctx context.Context, c *httptunnel.Client, cfg *
 	// Start local HTTP server to receive the SAML callback
 	sessionCh, err := httptunnel.ServeSAML(ctx, cfg.SAMLPort)
 	if err != nil {
-		return "", fmt.Errorf("auth: SAML server: %w", err)
+		return "", fmt.Errorf("authentication: SAML server: %w", err)
 	}
 
 	loginURL := httptunnel.SAMLLoginURL(cfg.GatewayHost, cfg.GatewayPort, cfg.SAMLPort)
@@ -36,7 +36,7 @@ func (a *SAMLAuth) Authenticate(ctx context.Context, c *httptunnel.Client, cfg *
 	// POST the session ID to the gateway
 	resp, err := c.Get(fmt.Sprintf("/remote/saml/auth_id?id=%s", sessionID))
 	if err != nil {
-		return "", fmt.Errorf("auth: SAML auth_id: %w", err)
+		return "", fmt.Errorf("authentication: SAML auth_id: %w", err)
 	}
 	if resp.StatusCode != 200 {
 		return "", fmt.Errorf("%w: SAML auth_id returned %d", ErrAuthFailed, resp.StatusCode)

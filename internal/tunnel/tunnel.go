@@ -139,7 +139,7 @@ func (t *Tunnel) connect(ctx context.Context) error {
 	authenticator := auth.New(cfg)
 	cookie, err := authenticator.Authenticate(ctx, httpCli, cfg)
 	if err != nil {
-		return fmt.Errorf("authentication: %w", err)
+		return err // auth errors already say "authentication ..."
 	}
 	slog.Info("Authentication successful")
 	httpCli.SetCookie(cookie)
