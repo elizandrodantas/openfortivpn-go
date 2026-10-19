@@ -94,3 +94,41 @@ func TestFindFrame_NoFrame(t *testing.T) {
 		t.Errorf("expected ErrNoFrameFound, got %v", err)
 	}
 }
+
+// TestFindFrame_SharedFlags is a regression test: Encoder emits back-to-back
+// frames that share one 0x7E ("7E A 7E B 7E C 7E"). Continuing the scan
+// from the closing flag must yield every frame; skipping past it lost every
+// other one — in a real session, the gateway's LCP Configure-Request that
+// follows its Configure-Ack, which kept the tunnel from ever coming up.
+func TestFindFrame_SharedFlags(t *testing.T) {
+	enc := NewEncoder()
+	want := [][]byte{{0xc0, 0x21, 2, 1, 0, 4}, {0xc0, 0x21, 1, 1, 0, 4}, {0x80, 0x21, 1, 1, 0, 4}}
+	var stream []byte
+	for _, pkt := range want {
+		stream, _ = enc.Encode(stream, pkt)
+	}
+
+	dec := Decoder{}
+	var got [][]byte
+	start := 0
+	for {
+		fs, fl, err := dec.FindFrame(stream, &start)
+		if err != nil {
+			break
+		}
+		pkt, err := dec.Decode(stream[fs : fs+fl])
+		if err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		got = append(got, pkt)
+		start = fs + fl
+	}
+	if len(got) != len(want) {
+		t.Fatalf("decoded %d frames, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if !bytes.Equal(got[i], want[i]) {
+			t.Fatalf("frame %d = % x, want % x", i, got[i], want[i])
+		}
+	}
+}

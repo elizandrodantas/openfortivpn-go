@@ -209,14 +209,13 @@ func ptyReader(ctx context.Context, cfg *LoopConfig, out chan<- []byte, once *sy
 				break
 			}
 			pkt, derr := dec.Decode(buf[frameStart : frameStart+frameLen])
+			// Advance to the frame's closing 0x7E, not past it: that flag
+			// also opens the next frame (see hdlc.Decoder.FindFrame).
+			start = frameStart + frameLen
 			if derr != nil {
 				slog.Debug("hdlc decode error", "err", derr)
-				start = frameStart + frameLen + 1
 				continue
 			}
-
-			// Advance past the consumed frame (including trailing 0x7E)
-			start = frameStart + frameLen + 1
 
 			select {
 			case out <- pkt:

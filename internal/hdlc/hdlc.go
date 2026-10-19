@@ -128,6 +128,11 @@ type Decoder struct{}
 // length of the first complete HDLC frame (without surrounding 0x7E bytes).
 // On success it updates *start to the frame's start offset.
 // Returns ErrNoFrameFound if no complete frame exists yet.
+//
+// Consecutive frames may share a single flag ("7E A 7E B 7E" — the form
+// Encoder produces), so to continue scanning the caller must set *start to
+// frameStart+frameLen, the closing flag, which is also the next frame's
+// opening flag. Skipping past it silently drops every other frame.
 func (Decoder) FindFrame(buf []byte, start *int) (frameStart, frameLen int, err error) {
 	s := -1
 	for i := *start; i < len(buf); i++ {
