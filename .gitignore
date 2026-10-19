@@ -10,3 +10,4 @@ dist/
 *.pcapng
 keylog.txt
 *.keylog
+captures/
