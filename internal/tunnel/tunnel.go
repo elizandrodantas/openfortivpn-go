@@ -161,6 +161,14 @@ func (t *Tunnel) connect(ctx context.Context) error {
 		return fmt.Errorf("TLS reconnect: %w", err)
 	}
 	t.tlsConn = conn
+	// Dial resolves the hostname again, and a gateway with several
+	// addresses may land on a different one than step 0 picked. The host
+	// route that keeps the tunnel's own connection out of the tunnel
+	// (setupRoutes) must cover the address it actually uses.
+	if tcpAddr, ok := rawConn.RemoteAddr().(*net.TCPAddr); ok && !tcpAddr.IP.Equal(cfg.GatewayIP) {
+		slog.Debug("tunnel connection uses a different gateway address", "resolved", cfg.GatewayIP, "connected", tcpAddr.IP)
+		cfg.GatewayIP = tcpAddr.IP
+	}
 	httpCli = httptunnel.NewClient(conn, fmt.Sprintf("%s:%d", cfg.GatewayHost, cfg.GatewayPort), cfg.UserAgent)
 	httpCli.SetCookie(cookie)
 
