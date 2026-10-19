@@ -98,3 +98,34 @@ func (r *retransmitter) resendNow() error {
 	r.next = time.Now().Add(RestartInterval)
 	return nil
 }
+
+// peerRequestGrace is how long negotiation waits, after the peer Acked our
+// Configure-Request, for the peer's own Configure-Request before treating
+// the layer as Opened anyway. A FortiGate sends its request in the same TLS
+// record as its Ack, so this only matters for gateways that never send one;
+// a request arriving later still gets answered by ServeLCP/ServeIPCP.
+var peerRequestGrace = 500 * time.Millisecond
+
+// recvNegotiation returns the next packet during a negotiation. Until the
+// peer has Acked our Configure-Request it retransmits on silence via rt.
+// Once it has, it never retransmits again — a Configure-Request arriving at
+// a peer whose side is already Opened restarts that peer's whole layer
+// (RFC 1661, and observed against a real FortiGate) — and only waits until
+// *grace (set on first use) for the peer's own request; done reports that
+// the grace period ran out.
+func recvNegotiation(ctx context.Context, link Link, rt *retransmitter, peerAckedUs bool, grace *time.Time) (pkt []byte, done bool, err error) {
+	if !peerAckedUs {
+		pkt, err = rt.recv(ctx, link)
+		return pkt, false, err
+	}
+	if grace.IsZero() {
+		*grace = time.Now().Add(peerRequestGrace)
+	}
+	gctx, cancel := context.WithDeadline(ctx, *grace)
+	defer cancel()
+	pkt, err = link.Recv(gctx)
+	if err != nil && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+		return nil, true, nil
+	}
+	return pkt, false, err
+}

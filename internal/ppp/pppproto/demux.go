@@ -6,31 +6,31 @@ import (
 )
 
 // Demux fans out packets from an underlying Link to one Link view per
-// protocol, so NegotiateLCP and NegotiateIPCP can run concurrently over a
-// single transport without racing to consume each other's packets from one
-// shared Recv call.
-//
-// This matters because a real gateway is not necessarily obligated to
-// finish LCP before it will accept IPCP: packet-capture comparison against
-// a working client showed LCP and IPCP Configure-Requests going out
-// together, not LCP fully completing before IPCP starts. A strictly
-// sequential client can end up waiting on a peer that isn't paying
-// attention to a lone, late IPCP request.
+// protocol: LCP, IPCP, and everything else (IPv4 data, or protocols we
+// don't support). It is meant to be the only reader of the underlying Link
+// for the whole session, so the LCP/IPCP negotiation, the ServeLCP/
+// ServeIPCP responders and the data path never race each other for
+// packets: the gateway's IPCP Configure-Request, which arrives while LCP is
+// still finishing, simply waits in the IPCP queue until NegotiateIPCP reads
+// it, and no data packet is ever dropped by a control-plane reader.
 type Demux struct {
-	link Link
-	lcp  chan []byte
-	ipcp chan []byte
-	errc chan error
+	link  Link
+	lcp   chan []byte
+	ipcp  chan []byte
+	other chan []byte
+	// err is why run stopped. It's written before the queues are closed,
+	// so any reader that sees a closed queue also sees it.
+	err error
 }
 
 // NewDemux starts fanning out packets from link in the background. It stops
 // when ctx is done or link.Recv returns an error.
 func NewDemux(ctx context.Context, link Link) *Demux {
 	d := &Demux{
-		link: link,
-		lcp:  make(chan []byte, 64),
-		ipcp: make(chan []byte, 64),
-		errc: make(chan error, 1),
+		link:  link,
+		lcp:   make(chan []byte, 64),
+		ipcp:  make(chan []byte, 64),
+		other: make(chan []byte, 256),
 	}
 	go d.run(ctx)
 	return d
@@ -39,13 +39,11 @@ func NewDemux(ctx context.Context, link Link) *Demux {
 func (d *Demux) run(ctx context.Context) {
 	defer close(d.lcp)
 	defer close(d.ipcp)
+	defer close(d.other)
 	for {
 		pkt, err := d.link.Recv(ctx)
 		if err != nil {
-			select {
-			case d.errc <- err:
-			default:
-			}
+			d.err = err
 			return
 		}
 		proto, _, ok := Protocol(pkt)
@@ -59,14 +57,21 @@ func (d *Demux) run(ctx context.Context) {
 		case ProtoIPCP:
 			ch = d.ipcp
 		default:
-			continue // e.g. CCP, or IPv4 data arriving before we're ready for it
+			ch = d.other
 		}
 		select {
 		case ch <- pkt:
 		case <-ctx.Done():
+			d.err = ctx.Err()
 			return
 		}
 	}
+}
+
+// Other returns a Link view that receives every packet that is neither LCP
+// nor IPCP.
+func (d *Demux) Other() Link {
+	return &demuxLink{demux: d, ch: d.other}
 }
 
 // Link returns a Link view that sends via the underlying transport (shared
@@ -96,12 +101,10 @@ func (l *demuxLink) Recv(ctx context.Context) ([]byte, error) {
 	select {
 	case pkt, ok := <-l.ch:
 		if !ok {
-			select {
-			case err := <-l.demux.errc:
-				return nil, err
-			default:
-				return nil, fmt.Errorf("pppproto: demux: link closed")
+			if l.demux.err != nil {
+				return nil, l.demux.err
 			}
+			return nil, fmt.Errorf("pppproto: demux: link closed")
 		}
 		return pkt, nil
 	case <-ctx.Done():

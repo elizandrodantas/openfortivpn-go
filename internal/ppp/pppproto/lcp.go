@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // LCPOptions configures our own outgoing LCP Configure-Request.
@@ -15,11 +16,14 @@ type LCPOptions struct {
 }
 
 // NegotiateLCP drives LCP to the Opened state against a single peer: our own
-// Configure-Request must be Acked by the peer. A peer's own Configure-Request
-// is Acked if one arrives, but — unlike a textbook symmetric LCP exchange —
-// is not required: several FortiGate gateways only ever passively Ack the
-// client's request and never propose their own, which a strict "both sides
-// must negotiate" implementation would wait on forever. It intentionally
+// Configure-Request must be Acked by the peer, and we must have Acked the
+// peer's own Configure-Request — until then the peer's side isn't Opened
+// and it silently discards IPCP. A FortiGate sends its request together
+// with its Ack of ours (often Ack first), so returning on the Ack alone
+// left that request unanswered. Some gateways never send a request at all,
+// so after the peer's Ack we only wait peerRequestGrace for one; ServeLCP
+// answers any that arrives later. Once Acked, our request is never
+// retransmitted: that would restart the peer's already-Opened LCP. It intentionally
 // never negotiates authentication, protocol field compression (PFC) or
 // address/control field compression (ACFC) — matching pppd's "noauth
 // noaccomp nopcomp" flags used on Unix — by rejecting those options if the
@@ -44,13 +48,17 @@ func NegotiateLCP(ctx context.Context, link Link, opts LCPOptions) error {
 		return fmt.Errorf("pppproto: LCP: %w", err)
 	}
 
-	var peerAckedUs bool
+	var peerAckedUs, weAckedPeer bool
+	var grace time.Time
 	retries := 0
 	rt := newRetransmitter(&retries, send)
-	for !peerAckedUs {
-		pkt, err := rt.recv(ctx, link)
+	for !peerAckedUs || !weAckedPeer {
+		pkt, done, err := recvNegotiation(ctx, link, rt, peerAckedUs, &grace)
 		if err != nil {
 			return fmt.Errorf("pppproto: LCP negotiation: %w", err)
+		}
+		if done {
+			break // peer Acked us but never sent its own request
 		}
 		proto, payload, ok := Protocol(pkt)
 		if !ok || proto != ProtoLCP {
@@ -63,13 +71,12 @@ func NegotiateLCP(ctx context.Context, link Link, opts LCPOptions) error {
 
 		switch cf.Code {
 		case CodeConfigureRequest:
-			// Opportunistic: Ack (or reject) the peer's own Configure-Request
-			// if it sends one, but don't require it to reach Opened — see
-			// the doc comment above.
-			resp, _ := reviewPeerLCPRequest(cf)
+			resp, rejected := reviewPeerLCPRequest(cf)
 			if err := link.Send(BuildFrame(ProtoLCP, resp.Marshal())); err != nil {
 				return fmt.Errorf("pppproto: LCP: %w", err)
 			}
+			// After a Reject the peer sends a new, trimmed request.
+			weAckedPeer = !rejected
 
 		case CodeConfigureAck:
 			if cf.ID == id {
@@ -77,7 +84,7 @@ func NegotiateLCP(ctx context.Context, link Link, opts LCPOptions) error {
 			}
 
 		case CodeConfigureNak, CodeConfigureReject:
-			if cf.ID != id {
+			if cf.ID != id || peerAckedUs {
 				continue
 			}
 			retries++

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"time"
 )
 
 // IPCPOptions configures our own outgoing IPCP Configure-Request.
@@ -31,12 +32,12 @@ type IPCPResult struct {
 // Jacobson header compression, so an IP-Compression-Protocol option in the
 // peer's own Configure-Request is rejected.
 //
-// It's typically run concurrently with NegotiateLCP (see Demux) rather than
-// after LCP completes: comparing a packet capture of a working client
-// against ours showed LCP and IPCP Configure-Requests going out together
-// from the start, not sequentially — some gateways don't necessarily
-// finish LCP before they'll process IPCP, so waiting for that can mean
-// waiting on a peer that already sent its (unanswered) IPCP reply.
+// It must only be started once NegotiateLCP has returned: the peer silently
+// discards IPCP until its side of LCP is Opened (RFC 1661), which is also
+// what pppd does. As with LCP, both directions must be Acked — the gateway
+// sends its own IPCP Configure-Request right after LCP opens — with the
+// same peerRequestGrace for peers that never send one (ServeIPCP answers a
+// late one), and our request is never retransmitted once Acked.
 func NegotiateIPCP(ctx context.Context, link Link, opts IPCPOptions) (IPCPResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, NegotiateTimeout)
 	defer cancel()
@@ -59,13 +60,17 @@ func NegotiateIPCP(ctx context.Context, link Link, opts IPCPOptions) (IPCPResult
 	// Configure-Request — a peer's own Configure-Request is handled if one
 	// arrives, but some gateways never send one and only passively Ack ours.
 	var result IPCPResult
-	var peerAckedUs bool
+	var peerAckedUs, weAckedPeer bool
+	var grace time.Time
 	retries := 0
 	rt := newRetransmitter(&retries, send)
-	for !peerAckedUs {
-		pkt, err := rt.recv(ctx, link)
+	for !peerAckedUs || !weAckedPeer {
+		pkt, done, err := recvNegotiation(ctx, link, rt, peerAckedUs, &grace)
 		if err != nil {
 			return IPCPResult{}, fmt.Errorf("pppproto: IPCP negotiation: %w", err)
+		}
+		if done {
+			break // peer Acked us but never sent its own request
 		}
 		proto, payload, ok := Protocol(pkt)
 		if !ok || proto != ProtoIPCP {
@@ -82,6 +87,7 @@ func NegotiateIPCP(ctx context.Context, link Link, opts IPCPOptions) (IPCPResult
 			if err := link.Send(BuildFrame(ProtoIPCP, resp.Marshal())); err != nil {
 				return IPCPResult{}, fmt.Errorf("pppproto: IPCP: %w", err)
 			}
+			weAckedPeer = !rejected
 			if !rejected {
 				if ip, ok := cf.FindOption(IPCPOptIPAddress); ok && len(ip.Data) == 4 {
 					result.PeerIP = net.IP(ip.Data).To4()
@@ -89,7 +95,7 @@ func NegotiateIPCP(ctx context.Context, link Link, opts IPCPOptions) (IPCPResult
 			}
 
 		case CodeConfigureAck:
-			if cf.ID != id {
+			if cf.ID != id || peerAckedUs {
 				continue
 			}
 			peerAckedUs = true
@@ -98,7 +104,7 @@ func NegotiateIPCP(ctx context.Context, link Link, opts IPCPOptions) (IPCPResult
 			result.DNS2 = proposed.dns2
 
 		case CodeConfigureNak:
-			if cf.ID != id {
+			if cf.ID != id || peerAckedUs {
 				continue
 			}
 			retries++
@@ -112,7 +118,7 @@ func NegotiateIPCP(ctx context.Context, link Link, opts IPCPOptions) (IPCPResult
 			}
 
 		case CodeConfigureReject:
-			if cf.ID != id {
+			if cf.ID != id || peerAckedUs {
 				continue
 			}
 			retries++
