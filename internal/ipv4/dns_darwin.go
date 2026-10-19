@@ -3,240 +3,335 @@
 package ipv4
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log/slog"
 	"net"
-	"os"
 	"os/exec"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 )
 
-const resolverDir = "/etc/resolver"
-
-// darwinDNS implements DNSManager on macOS.
+// darwinDNS implements DNSManager on macOS the same way the official
+// FortiClient (7.4, PrivilegedHelper's installDns/SetResolver, confirmed by
+// disassembly) does it, entirely through the SCDynamicStore and without
+// touching any file:
 //
-// With --use-pppd: Apple's own /usr/sbin/pppd publishes DNS natively into
-// the SCDynamicStore via "usepeerdns"+"serviceid" (wired in
-// internal/ppp/pppd_unix.go) whenever the FortiGate sends DNS options during
-// IPCP negotiation. That binary is Apple-signed and has built-in
-// SystemConfiguration integration (confirmed via strings: ConfirmedServiceID,
-// republish_dict, "SCDynamicStoreSetValue DNS/WINS") — matching the fields
-// observed on a live, working official-FortiClient session. Add() is a no-op
-// whenever this already happened (ipcpProvidedDNS == true).
+//  1. Find the primary network service (State:/Network/Global/IPv4
+//     PrimaryService) — the physical Wi-Fi/Ethernet service, not the tunnel.
+//  2. Back up its Setup:/Network/Service/<id>/DNS entity (normally absent:
+//     it's where manually configured DNS lives).
+//  3. Write the VPN nameservers (and search domain, if any) there. Setup:
+//     takes precedence over the DHCP-provided State: DNS, so the VPN
+//     servers become the system's default resolver — for both split and
+//     full tunnels, regardless of whether the gateway sends a domain.
+//  4. Watch it while connected and re-apply if something overwrites it (a
+//     network settings change republishes Setup:) or the primary service
+//     changes (e.g. switching Wi-Fi networks).
+//  5. On disconnect, restore the backup.
 //
-// Full tunnel (internet routed through the VPN interface, the default utun
-// backend): publish State:/Network/Service/<id>/{IPv4,DNS} ourselves, the
-// way openconnect's vpnc-script does on macOS. The IPv4 entry carries
-// InterfaceName + OverridePrimary, which is what makes configd promote the
-// service's DNS to the unscoped default resolver instead of a per-interface
-// scoped one (an earlier hand-rolled registration without OverridePrimary
-// only ever got the scoped tier).
+// FortiClient keeps its backup in a file; this keeps it in a volatile
+// SCDynamicStore key instead (backupKey), so it survives a crash of this
+// process but never outlives a reboot — which also clears the override,
+// since the dynamic store's Setup: entries are rebuilt from the saved
+// network preferences at boot. A backup left behind by a crashed run is
+// restored by NewDNSManager.
 //
-// Split tunnel, or if the publication above fails: /etc/resolver/<domain>
-// files, discovering the domain via PTR lookup when the XML didn't supply
-// one. This mechanism is NOT interface-bound: the kernel routes queries to
-// the nameserver via the normal routing table, so the VPN DNS server is
-// reached via the VPN interface using the VPN-assigned IP as source.
+// With --use-pppd, Apple's pppd publishes DNS itself ("usepeerdns" +
+// "serviceid", see internal/ppp/pppd_unix.go) whenever the gateway sends DNS
+// during IPCP; Add is a no-op then (ipcpProvidedDNS == true).
 type darwinDNS struct {
-	resolverFiles []string // files we created; removed on disconnect
-	scKeys        []string // SCDynamicStore keys we published; removed on disconnect
+	mu      sync.Mutex
+	servers []string
+	domain  string
+	service string // primary service ID currently overridden; "" if none
+	stop    context.CancelFunc
+	done    chan struct{}
 }
 
-// scServiceID is the SCDynamicStore service id used for our own DNS
-// publication (distinct from the "openfortivpn" serviceid handed to pppd).
-const scServiceID = "openfortivpn-go"
+const (
+	// backupKey holds the original DNS entity of the overridden service,
+	// plus backupServiceKey (its ID) and, if it had none, backupAbsentKey.
+	backupKey        = "State:/openfortivpn-go/DNSBackup"
+	backupServiceKey = "OpenfortivpnServiceID"
+	backupAbsentKey  = "OpenfortivpnAbsent"
 
-// NewDNSManager returns a macOS DNS manager.
+	// monitorInterval is how often the override is checked and re-applied.
+	monitorInterval = 3 * time.Second
+)
+
+// NewDNSManager returns a macOS DNS manager. It first restores any DNS
+// override left behind by a previous run that didn't exit cleanly.
 func NewDNSManager(_ bool) DNSManager {
+	if err := restoreBackup(); err != nil {
+		slog.Warn("could not restore DNS left over from a previous session", "err", err)
+	}
 	return &darwinDNS{}
 }
 
-func (d *darwinDNS) Add(iface string, assignedIP, ns1, ns2 net.IP, suffix string, ipcpProvidedDNS bool) error {
+func (d *darwinDNS) Add(_ string, _, ns1, ns2 net.IP, suffix string, ipcpProvidedDNS bool) error {
 	if ipcpProvidedDNS {
 		// pppd's own usepeerdns+serviceid already published this natively.
 		return nil
 	}
-
-	if routesInternetVia(iface) {
-		err := d.publishService(iface, assignedIP, ns1, ns2, suffix)
-		if err == nil {
-			slog.Debug("published VPN DNS as primary resolver", "service", scServiceID, "iface", iface)
-			flushDNSCache()
-			return nil
-		}
-		slog.Warn("could not publish VPN DNS via SCDynamicStore — falling back to /etc/resolver", "err", err)
-	}
-
-	// Discover the domain if the VPN server didn't provide one.
-	// PTR lookup of each nameserver via itself: e.g.
-	//   203.0.113.10 → "dns01.example.corp." → "example.corp"
-	if suffix == "" {
-		suffix = discoverDomain(ns1, ns2)
-		if suffix != "" {
-			slog.Debug("DNS domain discovered via PTR", "suffix", suffix)
-		}
-	}
-
-	if suffix == "" {
-		slog.Warn("no DNS domain available — internal hostnames may not resolve; " +
-			"set search= in the FortiGate DNS config")
-		return nil
-	}
-
-	// Create /etc/resolver/<domain> so mDNSResponder and libresolv both use
-	// the VPN nameservers for this domain without interface binding.
-	if err := os.MkdirAll(resolverDir, 0755); err != nil {
-		return fmt.Errorf("ipv4 dns: mkdir %s: %w", resolverDir, err)
-	}
-
-	path := resolverDir + "/" + suffix
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "domain %s\n", suffix)
-	fmt.Fprintf(&sb, "search %s\n", suffix)
-	if ns1 != nil {
-		fmt.Fprintf(&sb, "nameserver %s\n", ns1.String())
-	}
-	if ns2 != nil {
-		fmt.Fprintf(&sb, "nameserver %s\n", ns2.String())
-	}
-	if err := os.WriteFile(path, []byte(sb.String()), 0644); err != nil {
-		return fmt.Errorf("ipv4 dns: write %s: %w", path, err)
-	}
-	d.resolverFiles = append(d.resolverFiles, path)
-	slog.Debug("created resolver file", "path", path)
-
-	flushDNSCache()
-	return nil
-}
-
-// publishService registers the VPN as a primary network service carrying
-// its DNS servers, via scutil.
-func (d *darwinDNS) publishService(iface string, assignedIP, ns1, ns2 net.IP, suffix string) error {
 	var servers []string
 	for _, ns := range []net.IP{ns1, ns2} {
 		if ns != nil {
 			servers = append(servers, ns.String())
 		}
 	}
-	if len(servers) == 0 || assignedIP == nil {
-		return fmt.Errorf("no nameservers or assigned IP to publish")
+	if len(servers) == 0 {
+		return fmt.Errorf("ipv4 dns: no nameservers to configure")
 	}
 
-	ipv4Key := "State:/Network/Service/" + scServiceID + "/IPv4"
-	dnsKey := "State:/Network/Service/" + scServiceID + "/DNS"
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.servers, d.domain = servers, suffix
 
-	var sb strings.Builder
-	sb.WriteString("d.init\n")
-	fmt.Fprintf(&sb, "d.add Addresses * %s\n", assignedIP)
-	sb.WriteString("d.add SubnetMasks * 255.255.255.255\n")
-	fmt.Fprintf(&sb, "d.add Router %s\n", assignedIP)
-	fmt.Fprintf(&sb, "d.add InterfaceName %s\n", iface)
-	sb.WriteString("d.add OverridePrimary # 1\n")
-	fmt.Fprintf(&sb, "set %s\n", ipv4Key)
-	sb.WriteString("d.init\n")
-	fmt.Fprintf(&sb, "d.add ServerAddresses * %s\n", strings.Join(servers, " "))
-	if suffix != "" {
-		fmt.Fprintf(&sb, "d.add DomainName %s\n", suffix)
-		fmt.Fprintf(&sb, "d.add SearchDomains * %s\n", suffix)
-	}
-	fmt.Fprintf(&sb, "set %s\n", dnsKey)
-	sb.WriteString("quit\n")
-
-	// Record the keys before running, so a partial failure is still
-	// cleaned up by Remove.
-	d.scKeys = append(d.scKeys, ipv4Key, dnsKey)
-	return runScutil(sb.String())
-}
-
-func runScutil(script string) error {
-	cmd := exec.Command("scutil")
-	cmd.Stdin = strings.NewReader(script)
-	out, err := cmd.CombinedOutput()
+	service, err := primaryService()
 	if err != nil {
-		return fmt.Errorf("scutil: %w (%s)", err, strings.TrimSpace(string(out)))
+		return err
 	}
+	if err := d.override(service); err != nil {
+		return err
+	}
+	slog.Debug("VPN DNS set on primary service", "service", service, "servers", servers, "domain", suffix)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	d.stop, d.done = cancel, make(chan struct{})
+	go d.monitor(ctx, d.done)
 	return nil
-}
-
-// routesInternetVia reports whether internet traffic is routed through
-// iface, i.e. this is a full tunnel (default route or the two /1 routes
-// from --half-internet-routes), as opposed to split tunneling.
-func routesInternetVia(iface string) bool {
-	if iface == "" {
-		return false
-	}
-	out, err := exec.Command("route", "-n", "get", "1.1.1.1").Output()
-	if err != nil {
-		return false
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		k, v, ok := strings.Cut(strings.TrimSpace(line), ":")
-		if ok && k == "interface" {
-			return strings.TrimSpace(v) == iface
-		}
-	}
-	return false
 }
 
 func (d *darwinDNS) Remove(_, _ net.IP, _ string) error {
-	var errs []string
-	if len(d.scKeys) > 0 {
-		var sb strings.Builder
-		for _, k := range d.scKeys {
-			fmt.Fprintf(&sb, "remove %s\n", k)
-		}
-		sb.WriteString("quit\n")
-		if err := runScutil(sb.String()); err != nil {
-			errs = append(errs, err.Error())
-		}
-		d.scKeys = nil
+	d.mu.Lock()
+	stop, done := d.stop, d.done
+	d.stop, d.done = nil, nil
+	d.mu.Unlock()
+	if stop != nil {
+		stop()
+		<-done
 	}
-	for _, path := range d.resolverFiles {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			errs = append(errs, fmt.Sprintf("remove %s: %v", path, err))
-		}
-	}
-	d.resolverFiles = nil
 
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.service = ""
+	err := restoreBackup()
 	flushDNSCache()
+	return err
+}
 
-	if len(errs) > 0 {
-		return fmt.Errorf("ipv4 dns remove: %s", strings.Join(errs, "; "))
+// override backs up service's Setup: DNS entity (once per session) and
+// replaces its nameservers and search domain with the VPN's.
+func (d *darwinDNS) override(service string) error {
+	if d.service != "" && d.service != service {
+		// The primary service changed: give the old one its DNS back first.
+		if err := restoreBackup(); err != nil {
+			return err
+		}
+		d.service = ""
+	}
+	if d.service == "" {
+		if err := backup(service); err != nil {
+			return err
+		}
+		d.service = service
+	}
+
+	key := setupDNSKey(service)
+	var sb strings.Builder
+	if exists, err := keyExists(key); err != nil {
+		return err
+	} else if exists {
+		fmt.Fprintf(&sb, "get %s\n", key) // keep any other fields it has
+	} else {
+		sb.WriteString("d.init\n")
+	}
+	fmt.Fprintf(&sb, "d.add ServerAddresses * %s\n", strings.Join(d.servers, " "))
+	if d.domain != "" {
+		fmt.Fprintf(&sb, "d.add SearchDomains * %s\n", d.domain)
+	}
+	fmt.Fprintf(&sb, "set %s\n", key)
+	if _, err := scutil(sb.String()); err != nil {
+		return fmt.Errorf("ipv4 dns: set %s: %w", key, err)
+	}
+	flushDNSCache()
+	return nil
+}
+
+// monitor re-applies the override whenever it's lost: the primary service
+// changed, or the system rewrote its Setup: DNS entity.
+func (d *darwinDNS) monitor(ctx context.Context, done chan struct{}) {
+	defer close(done)
+	t := time.NewTicker(monitorInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		d.mu.Lock()
+		if err := d.check(); err != nil {
+			slog.Warn("could not re-apply VPN DNS", "err", err)
+		}
+		d.mu.Unlock()
+	}
+}
+
+func (d *darwinDNS) check() error {
+	service, err := primaryService()
+	if err != nil {
+		return err // e.g. no network at all right now; retry next tick
+	}
+	if service == d.service {
+		out, err := scutil(fmt.Sprintf("show %s\n", setupDNSKey(service)))
+		if err != nil {
+			return err
+		}
+		if slices.Equal(arrayValues(out, "ServerAddresses"), d.servers) {
+			return nil
+		}
+		slog.Info("VPN DNS was overwritten, re-applying", "service", service)
+	} else {
+		slog.Info("primary network service changed, moving VPN DNS", "from", d.service, "to", service)
+	}
+	return d.override(service)
+}
+
+func setupDNSKey(service string) string {
+	return "Setup:/Network/Service/" + service + "/DNS"
+}
+
+// primaryService returns the ID of the current primary network service.
+func primaryService() (string, error) {
+	out, err := scutil("show State:/Network/Global/IPv4\n")
+	if err != nil {
+		return "", err
+	}
+	if id := dictValue(out, "PrimaryService"); id != "" {
+		return id, nil
+	}
+	return "", fmt.Errorf("ipv4 dns: no primary network service")
+}
+
+// backup saves service's current Setup: DNS entity into backupKey, unless a
+// backup already exists (it is the original; never overwrite it with our
+// own override).
+func backup(service string) error {
+	if exists, err := keyExists(backupKey); err != nil || exists {
+		return err
+	}
+	key := setupDNSKey(service)
+	exists, err := keyExists(key)
+	if err != nil {
+		return err
+	}
+	var sb strings.Builder
+	if exists {
+		fmt.Fprintf(&sb, "get %s\n", key)
+	} else {
+		sb.WriteString("d.init\n")
+		fmt.Fprintf(&sb, "d.add %s # 1\n", backupAbsentKey)
+	}
+	fmt.Fprintf(&sb, "d.add %s %s\n", backupServiceKey, service)
+	fmt.Fprintf(&sb, "set %s\n", backupKey)
+	if _, err := scutil(sb.String()); err != nil {
+		return fmt.Errorf("ipv4 dns: back up %s: %w", key, err)
 	}
 	return nil
 }
 
-// discoverDomain does a reverse-DNS lookup of each nameserver IP via the
-// nameserver itself. Corporate DNS servers typically have PTR records like
-// "dns01.example.corp." — we return the last two labels as the domain
-// (e.g. "example.corp"). Times out after 3 s per server.
-func discoverDomain(ns1, ns2 net.IP) string {
-	for _, ns := range []net.IP{ns1, ns2} {
-		if ns == nil {
-			continue
+// restoreBackup puts back the DNS entity saved by backup, if any.
+func restoreBackup() error {
+	out, err := scutil(fmt.Sprintf("show %s\n", backupKey))
+	if err != nil {
+		return err
+	}
+	service := dictValue(out, backupServiceKey)
+	if service == "" {
+		return nil // no backup: nothing to restore
+	}
+	key := setupDNSKey(service)
+	var sb strings.Builder
+	if dictValue(out, backupAbsentKey) != "" {
+		fmt.Fprintf(&sb, "remove %s\n", key)
+	} else {
+		fmt.Fprintf(&sb, "get %s\n", backupKey)
+		fmt.Fprintf(&sb, "d.remove %s\n", backupServiceKey)
+		fmt.Fprintf(&sb, "set %s\n", key)
+	}
+	fmt.Fprintf(&sb, "remove %s\n", backupKey)
+	if _, err := scutil(sb.String()); err != nil {
+		return fmt.Errorf("ipv4 dns: restore %s: %w", key, err)
+	}
+	slog.Debug("restored original DNS", "service", service)
+	return nil
+}
+
+func keyExists(key string) (bool, error) {
+	out, err := scutil(fmt.Sprintf("show %s\n", key))
+	if err != nil {
+		return false, err
+	}
+	return !strings.Contains(out, "No such key"), nil
+}
+
+// scutil runs a script of scutil commands against the SCDynamicStore.
+// scutil exits 0 even when a command fails, printing e.g. "Permission
+// denied" instead, so its output is checked too ("No such key" is not an
+// error: it's how a missing key reads).
+func scutil(script string) (string, error) {
+	cmd := exec.Command("scutil")
+	cmd.Stdin = strings.NewReader(script + "quit\n")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("scutil: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	for _, failure := range []string{"Permission denied", "failed", "Invalid", "invalid"} {
+		if strings.Contains(string(out), failure) {
+			return "", fmt.Errorf("scutil: %s", strings.TrimSpace(string(out)))
 		}
-		nsAddr := ns.String() + ":53"
-		r := &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, "udp", nsAddr)
-			},
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		names, err := r.LookupAddr(ctx, ns.String())
-		cancel()
-		if err != nil || len(names) == 0 {
-			continue
-		}
-		fqdn := strings.TrimSuffix(names[0], ".")
-		parts := strings.Split(fqdn, ".")
-		if len(parts) >= 2 {
-			return strings.Join(parts[len(parts)-2:], ".")
+	}
+	return string(out), nil
+}
+
+// dictValue returns a top-level scalar from scutil's dictionary output
+// ("  Key : value"), or "".
+func dictValue(out, key string) string {
+	sc := bufio.NewScanner(strings.NewReader(out))
+	for sc.Scan() {
+		k, v, ok := strings.Cut(strings.TrimSpace(sc.Text()), " : ")
+		if ok && k == key {
+			return strings.TrimSpace(v)
 		}
 	}
 	return ""
+}
+
+// arrayValues returns the elements of an array in scutil's dictionary
+// output ("  Key : <array> {" / "    0 : value" / "  }").
+func arrayValues(out, key string) []string {
+	var vals []string
+	in := false
+	sc := bufio.NewScanner(strings.NewReader(out))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if !in {
+			in = line == key+" : <array> {"
+			continue
+		}
+		if line == "}" {
+			break
+		}
+		if _, v, ok := strings.Cut(line, " : "); ok {
+			vals = append(vals, strings.TrimSpace(v))
+		}
+	}
+	return vals
 }
 
 // flushDNSCache asks mDNSResponder to reload its config immediately instead

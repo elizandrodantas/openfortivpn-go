@@ -56,7 +56,7 @@ DNS handling is implemented per-platform to match each OS's native mechanisms as
 
 - **Linux** — updates `/etc/resolv.conf` directly (with automatic backup/restore of the original file), or delegates to `resolvconf` if available (`--pppd-use-peerdns` / `use-resolvconf` in the config file).
 - **Windows** — configures DNS servers on the PPP interface via `netsh interface ip set/add dns`, restoring DHCP-sourced DNS on disconnect.
-- **macOS** — on a full tunnel, publishes the VPN as the primary network service in `SCDynamicStore` (`State:/Network/Service/openfortivpn-go/{IPv4,DNS}` with `OverridePrimary`, the same approach openconnect's `vpnc-script` uses), so the VPN DNS servers become the default resolver. On a split tunnel (or if that publication fails) it writes scoped resolver files under `/etc/resolver/<domain>` — and if no DNS search domain was provided by the gateway, it **automatically discovers one via a reverse-DNS (PTR) lookup** of the assigned DNS servers. With `--use-pppd`, Apple's own signed `pppd` publishes DNS natively instead (via `usepeerdns` + a registered `serviceid`) whenever the gateway hands out DNS during IPCP. The DNS cache is flushed (`dscacheutil` + `mDNSResponder`) after any change.
+- **macOS** — configures DNS the same way the official FortiClient does, entirely through the `SCDynamicStore` and without writing any file: the VPN nameservers (and search domain, if the gateway sends one) are set on the primary network service's `Setup:` DNS entity — the same place manually configured DNS lives — so they become the system's default resolver on both split and full tunnels. The original value is backed up in a volatile `SCDynamicStore` key, re-applied if the system overwrites it or the primary service changes (e.g. switching Wi-Fi networks), and restored on disconnect (or on the next start, after a crash). With `--use-pppd`, Apple's `pppd` publishes DNS itself (via `usepeerdns` + a registered `serviceid`) whenever the gateway hands out DNS during IPCP. The DNS cache is flushed (`dscacheutil` + `mDNSResponder`) after any change.
 - **`--no-dns`** — disable all DNS configuration changes.
 
 ### Reliability & operations
@@ -279,7 +279,7 @@ The version string embedded in binaries (visible via `--version`) is derived fro
 ## Known limitations
 
 - **Windows support is new and needs real-world testing.** Since there's no `pppd` on Windows, `openfortivpn-go` implements its own minimal PPP client (LCP/IPCP negotiation, see `internal/ppp/pppproto`) on top of a [`wintun`](https://www.wintun.net/) virtual adapter. It requires **Administrator privileges**; `wintun.dll` is fetched automatically on first run if not already present (see [Requirements](#requirements)), which needs internet access at that point. If you hit issues, please open one with `-vvv --log-file` output attached.
-- On a macOS split tunnel, DNS uses scoped resolver entries under `/etc/resolver/<domain>`, so only that domain is resolved by the VPN servers. If no search domain is configured and PTR auto-discovery finds none, internal hostnames may not resolve.
+- On macOS, every DNS query goes to the VPN nameservers while connected (as with FortiClient when the gateway defines no split-DNS domains), so name resolution depends on the tunnel being up.
 - The macOS `utun` backend is new. `--pppd-ifname` doesn't apply to it, because the kernel picks the `utunN` name. If you hit issues, `--use-pppd` falls back to the previous behavior; please open an issue with `-vvv --log-file` output.
 
 ## Contributing
